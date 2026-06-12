@@ -482,7 +482,7 @@ def main():
                     if v not in res:
                         continue
                     for s in strategies:
-                        acc[split][v][bucket][s].append(res[v][s])
+                        acc[split][v][area_tier][s].append(res[v][s])
                 if (i + 1) % 50 == 0:
                     log_line(f'[loc] scale={scale:.2f} {split} {i+1}/{len(items)}')
 
