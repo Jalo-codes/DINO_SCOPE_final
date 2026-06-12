@@ -145,21 +145,24 @@ def main():
 
             inp = normalize(TF.to_tensor(TF.resize(source, [T, T], Image.BILINEAR))).to(device)
 
-            # 1. K-means swin decode
-            km_full, km_swin = sliding_window_contrastive_masks(
-                model, inp, device, n_patch_per_side=n,
-                scales=args.scales, stride_frac=args.stride,
-                decode_spec=kmeans_spec, bce_gate_threshold=args.bce_gate_threshold,
-                source_image=source
-            )
+            with torch.no_grad():
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16,
+                                    enabled=(device.type == 'cuda')):
+                    # 1. K-means swin decode
+                    km_full, km_swin = sliding_window_contrastive_masks(
+                        model, inp, device, n_patch_per_side=n,
+                        scales=args.scales, stride_frac=args.stride,
+                        decode_spec=kmeans_spec, bce_gate_threshold=args.bce_gate_threshold,
+                        source_image=source
+                    )
 
-            # 2. Graph swin decode
-            g_full, g_swin = sliding_window_contrastive_masks(
-                model, inp, device, n_patch_per_side=n,
-                scales=args.scales, stride_frac=args.stride,
-                decode_spec=graph_spec, bce_gate_threshold=args.bce_gate_threshold,
-                source_image=source
-            )
+                    # 2. Graph swin decode
+                    g_full, g_swin = sliding_window_contrastive_masks(
+                        model, inp, device, n_patch_per_side=n,
+                        scales=args.scales, stride_frac=args.stride,
+                        decode_spec=graph_spec, bce_gate_threshold=args.bce_gate_threshold,
+                        source_image=source
+                    )
 
             panels = [
                 ('Original', src_np),
