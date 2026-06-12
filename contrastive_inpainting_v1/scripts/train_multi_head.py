@@ -1410,6 +1410,22 @@ def main():
             ('sagid', sagid_val_items),
             ('bfree', bfree_val_items),
         ]
+        if args.tgif_root:
+            tg_fakes, tg_reals = build_tgif2_items(
+                args.tgif_root, args.tgif_index, include_reals=True,
+                coco_ids=tgif_eval_ids,
+                types=({'fr'} if tgif_eval_ids is not None else None))
+            if tg_fakes and tg_reals:
+                tg_fakes = _tgif_model_filter(
+                    tg_fakes, args.tgif_model, log_tag='[cfg]', tag='tgif')
+                _tgif_mask_cache = os.path.join(args.checkpoint_root, 'tgif_mask_cache')
+                tg_fakes = _prep_tgif_items(
+                    tg_fakes, mask_cache_dir=_tgif_mask_cache,
+                    log_tag='[cfg]', tag='tgif fakes')
+                tg_reals = _prep_tgif_items(
+                    tg_reals, mask_cache_dir=_tgif_mask_cache,
+                    log_tag='[cfg]', tag='tgif reals')
+                _viz_srcs.append(('tgif', tg_fakes + tg_reals))
         _vs, _vr = [], []
         for _name, _items in _viz_srcs:
             _s = [it for it in _items if it.get('kind') in _SPLICE_KINDS and it.get('mask')]
@@ -1417,6 +1433,7 @@ def main():
             _vs += _subsample_items(_s, 2, seed=f'viz_{_name}')
             _vr += _subsample_items(_r, 1, seed=f'viz_{_name}')
         viz_items = _vs + _subsample_items(_vr, 2, seed='viz_real')
+
 
     # ── model ────────────────────────────────────────────────────────────────
     model = build_multi_head_detector(
