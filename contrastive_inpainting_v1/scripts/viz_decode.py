@@ -36,7 +36,6 @@ from PIL import Image
 from torchvision import transforms
 
 from lab_utils.data.sampling import deterministic_subsample
-from lab_utils.logging.text import install_log, log_line
 from lab_utils.train.checkpoint import load as ckpt_load
 from lab_utils.model.multi_head_detector import build_multi_head_detector
 from lab_utils.eval.partition import DecodeSpec, decode_deploy_mask
@@ -68,7 +67,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('--graph_knn', type=int, default=10)
     p.add_argument('--graph_spatial', type=int, default=2,
                    help='Chebyshev radius for the Graph+spatial panel (0/neg to skip).')
-    p.add_argument('--output_log', type=str, default=None)
     return p
 
 
@@ -84,9 +82,6 @@ def main():
     args = _build_parser().parse_args()
     from contrastive_inpainting_v1.pipeline.cli import apply_path_defaults
     apply_path_defaults(args)
-    if args.output_log:
-        os.makedirs(os.path.dirname(os.path.abspath(args.output_log)), exist_ok=True)
-        install_log(args.output_log)
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device(args.device if (args.device != 'cuda' or torch.cuda.is_available()) else 'cpu')
     cfg = Config()
@@ -105,7 +100,7 @@ def main():
                                 r_spatial=int(args.graph_spatial))
                      if do_spatial else None)
 
-    log_line(f'[viz] ckpt={args.ckpt} tau_pos={args.tau_pos} tau_neg={args.tau_neg} '
+    print(f'[viz] ckpt={args.ckpt} tau_pos={args.tau_pos} tau_neg={args.tau_neg} '
              f's_edge={args.graph_s_edge} knn={args.graph_knn} '
              f'spatial={args.graph_spatial if do_spatial else "off"} → {args.out_dir}/')
 
@@ -123,7 +118,7 @@ def main():
     }
     for k in by_split:
         by_split[k] = deterministic_subsample(by_split[k], args.n_items, seed='vizdecode')
-    log_line(f'[viz] items: imd={len(by_split["imd_val"])} casia={len(by_split["casia_val"])}')
+    print(f'[viz] items: imd={len(by_split["imd_val"])} casia={len(by_split["casia_val"])}')
 
     # ── model ────────────────────────────────────────────────────────────────
     ckpt = ckpt_load(args.ckpt, map_location=str(device))
@@ -132,7 +127,7 @@ def main():
     p_hidden = int(sd['pool.V.weight'].shape[0]) if 'pool.V.weight' in sd else 0
     has_patch = 'patch_head.weight' in sd
     if c_dim <= 0:
-        log_line('[viz] ERROR: checkpoint has no contrastive head — nothing to decode.')
+        print('[viz] ERROR: checkpoint has no contrastive head — nothing to decode.')
         return
     model = build_multi_head_detector(
         model_name=cfg.MODEL_NAME, resolution=cfg.resolution,
@@ -140,7 +135,7 @@ def main():
         lora_dropout=cfg.LORA_DROPOUT, lora_targets=cfg.LORA_TARGETS,
         contrastive_dim=c_dim, pool_hidden=p_hidden, patch_bce=has_patch, device=device)
     model.load_state_dict(sd); model.eval()
-    log_line(f'[viz] loaded epoch={ckpt.get("epoch","?")} c_dim={c_dim} pool_hidden={p_hidden}')
+    print(f'[viz] loaded epoch={ckpt.get("epoch","?")} c_dim={c_dim} pool_hidden={p_hidden}')
 
     n_saved = 0
     for split, items in by_split.items():
@@ -149,7 +144,7 @@ def main():
             try:
                 source = Image.open(img_path).convert('RGB')
             except Exception as exc:
-                log_line(f'[viz] WARN load failed {img_path}: {exc}')
+                print(f'[viz] WARN load failed {img_path}: {exc}')
                 continue
             W, H = source.size
             src_np = np.asarray(source, dtype=np.uint8)
@@ -201,7 +196,7 @@ def main():
             save_composite(panels, save_path, panel_size=int(args.panel_size), cols=6)
             n_saved += 1
 
-    log_line(f'[viz] saved {n_saved} composites to {args.out_dir}/')
+    print(f'[viz] saved {n_saved} composites to {args.out_dir}/')
 
 
 if __name__ == '__main__':
