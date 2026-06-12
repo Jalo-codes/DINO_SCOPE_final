@@ -214,7 +214,7 @@ def main():
             except Exception:
                 pass
 
-            inp = normalize(TF.to_tensor(TF.resize(source, [T, T], Image.BILINEAR))).to(device)
+            inp = normalize(TF.to_tensor(TF.resize(source, [T, T], Image.BILINEAR))).unsqueeze(0).to(device)
 
             # Full Image Forward
             with torch.no_grad():
