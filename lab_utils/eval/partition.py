@@ -682,6 +682,7 @@ def graph_components_decode(
                  if bg_idx.size else 0.0)
         accepted = bool(within >= theta_w and cross <= theta_x)
         components.append({
+            'comp_id': int(c),
             'size': int(idx.size), 'within': within, 'cross': cross,
             'margin': within - cross, 'accepted': accepted,
         })
@@ -694,6 +695,8 @@ def graph_components_decode(
         'abstained': bool(mask.sum() == 0),
         'n_components': int(comp_ids.size),
         'background_size': bg_size,
+        'background_id': int(bg_id),
+        'labels': labels.copy(),
         'components': components,
         'n_accepted': int(sum(c['accepted'] for c in components)),
     })
