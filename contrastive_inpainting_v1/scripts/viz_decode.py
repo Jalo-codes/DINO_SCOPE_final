@@ -190,6 +190,7 @@ def main():
     for split, items in by_split.items():
         for idx, it in enumerate(items):
             img_path = str(it.get('img', ''))
+            stem = os.path.splitext(os.path.basename(img_path))[0]
             try:
                 source = Image.open(img_path).convert('RGB')
             except Exception as exc:
