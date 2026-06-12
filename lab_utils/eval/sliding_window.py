@@ -270,6 +270,7 @@ def tile_window_contrastive_masks(
     stride_frac: float = 1.0,
     inner_batch_size: int = 8,
     kmeans_init: int = 4,
+    decode_spec=None,
     bce_gate_threshold: Optional[float] = 0.0,
     max_windows: int = 8,
     normalize_mean: Tuple[float, float, float] = _DEFAULT_NORMALIZE_MEAN,
@@ -312,7 +313,9 @@ def tile_window_contrastive_masks(
                     region touches the crop boundary. High values suggest
                     more overlap/windows may help.
     """
-    from lab_utils.eval.partition import spherical_kmeans2
+    from lab_utils.eval.partition import DecodeSpec, decode_deploy_mask
+    if decode_spec is None:
+        decode_spec = DecodeSpec(n_init=int(kmeans_init))
 
     if source_image is None:
         raise ValueError('tile_window_contrastive_masks: source_image is required '
@@ -393,20 +396,14 @@ def tile_window_contrastive_masks(
     logits_all = np.concatenate(logit_chunks, axis=0) if logit_chunks else None
     att_all    = np.concatenate(att_chunks,   axis=0) if att_chunks   else None
 
-    # Per-window mask: kmeans → BCE-attention cluster polarity → (n, n) bool.
+    # Per-window mask: decode (kmeans+attention polarity, or calibrated graph)
+    # → committed foreground → (n, n) bool.
     win_masks: List[np.ndarray] = []
     for k in range(z_all.shape[0]):
-        raw_labels, _ = spherical_kmeans2(z_all[k], n_init=int(kmeans_init))
-        if att_all is not None:
-            a = att_all[k]
-            m0 = (raw_labels == 0); m1 = (raw_labels == 1)
-            a0 = float(a[m0].mean()) if m0.any() else -np.inf
-            a1 = float(a[m1].mean()) if m1.any() else -np.inf
-            splice_label = 0 if a0 >= a1 else 1
-        else:
-            n0 = int((raw_labels == 0).sum()); n1 = int((raw_labels == 1).sum())
-            splice_label = 0 if n0 <= n1 else 1
-        win_masks.append((raw_labels == splice_label).astype(np.bool_).reshape(n, n))
+        att_k = att_all[k] if att_all is not None else None
+        win_fg, _ = decode_deploy_mask(z_all[k], decode_spec, attention=att_k,
+                                       grid_hw=(n, n))
+        win_masks.append(win_fg.astype(np.bool_).reshape(n, n))
 
     if bce_gate_threshold is not None and logits_all is None:
         raise RuntimeError(
@@ -477,6 +474,7 @@ def sliding_window_contrastive_masks(
     stride_frac: float = 0.5,
     inner_batch_size: int = 8,
     kmeans_init: int = 4,
+    decode_spec=None,
     bce_gate_threshold: float = None,
     source_image: Optional[Image.Image] = None,
     normalize_mean: Tuple[float, float, float] = _DEFAULT_NORMALIZE_MEAN,
@@ -519,7 +517,9 @@ def sliding_window_contrastive_masks(
         If all windows are gated out, swin_mask is all-zeros.
     """
     # Local import to avoid circular dep (eval.partition imports from elsewhere).
-    from lab_utils.eval.partition import spherical_kmeans2
+    from lab_utils.eval.partition import DecodeSpec, decode_deploy_mask
+    if decode_spec is None:
+        decode_spec = DecodeSpec(n_init=int(kmeans_init))
 
     C, H, W = img.shape
     n = int(n_patch_per_side)
@@ -572,23 +572,17 @@ def sliding_window_contrastive_masks(
     att_all = (np.concatenate(att_chunks, axis=0)
                if att_chunks else None)        # (n_crops, N) or None
 
-    # Per-crop: kmeans → cluster reshaped to (n, n). Cluster polarity comes
-    # from BCE attention (if available) — cluster with HIGHER mean attention
-    # is the splice. Falls back to smaller-cluster rule when no BCE head.
+    # Per-crop: decode → committed foreground reshaped to (n, n). For k-means,
+    # cluster polarity comes from BCE attention (cluster with HIGHER mean
+    # attention is the splice; smaller-cluster fallback when no BCE head). For
+    # the graph decode the accepted components are already the committed
+    # foreground (no re-polarization).
     win_masks = []
     for k in range(z_all.shape[0]):
-        raw_labels, _ = spherical_kmeans2(z_all[k], n_init=int(kmeans_init))
         att_k = att_all[k] if att_all is not None else None
-        if att_k is not None:
-            m0 = (raw_labels == 0); m1 = (raw_labels == 1)
-            a0 = float(att_k[m0].mean()) if m0.any() else -np.inf
-            a1 = float(att_k[m1].mean()) if m1.any() else -np.inf
-            splice_label = 0 if a0 >= a1 else 1
-        else:
-            n0 = int((raw_labels == 0).sum()); n1 = int((raw_labels == 1).sum())
-            splice_label = 0 if n0 <= n1 else 1
-        win_mask = (raw_labels == splice_label).astype(np.bool_).reshape(n, n)
-        win_masks.append(win_mask)
+        win_fg, _ = decode_deploy_mask(z_all[k], decode_spec, attention=att_k,
+                                       grid_hw=(n, n))
+        win_masks.append(win_fg.astype(np.bool_).reshape(n, n))
 
     # Full-image (raw, un-aggregated) — first crop. Always returned, never
     # gated, so the caller can compare full vs. swin even when the BCE head

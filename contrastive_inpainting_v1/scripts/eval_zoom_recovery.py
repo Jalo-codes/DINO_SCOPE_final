@@ -121,6 +121,8 @@ def main():
     p.add_argument('--num_workers', type=int, default=2)
     p.add_argument('--device', type=str, default='cuda')
     p.add_argument('--output_log', type=str, default=None)
+    from lab_utils.eval.decode_cli import add_decode_args
+    add_decode_args(p)
     args = p.parse_args()
     from contrastive_inpainting_v1.pipeline.cli import apply_path_defaults
     apply_path_defaults(args)
@@ -170,6 +172,10 @@ def main():
     log_line(f'[zoom] loaded epoch={ckpt.get("epoch", "?")} '
              f'contrastive_dim={contrastive_dim} pool_hidden={pool_hidden}')
 
+    from lab_utils.eval.decode_cli import decode_spec_from_args, decode_label
+    decode_spec = decode_spec_from_args(args)
+    log_line(f'[zoom] decode={decode_label(decode_spec)}')
+
     for items, tag in ((imd_val, 'imd_val'), (casia_val, 'casia_val')):
         if not items:
             continue
@@ -189,7 +195,7 @@ def main():
                 swin_bce_gate_threshold=0.0,
                 swin_use_source_resolution=True,
                 swin_normalize_mean=cfg.IMAGENET_MEAN, swin_normalize_std=cfg.IMAGENET_STD,
-                res=cfg.resolution, log_tag='[swin]', tag=tag,
+                res=cfg.resolution, decode_spec=decode_spec, log_tag='[swin]', tag=tag,
             )
             if lsamples:
                 report_localization_threshold_sweep(
@@ -205,7 +211,7 @@ def main():
             res=cfg.resolution, cov_range=tuple(args.cov_range),
             seed=f'zoomrec|{tag}',
             normalize_mean=cfg.IMAGENET_MEAN, normalize_std=cfg.IMAGENET_STD,
-            log_tag='[zoom]', tag=tag,
+            decode_spec=decode_spec, log_tag='[zoom]', tag=tag,
         )
         report_zoom_eval(zsamples, log_tag='[zoom]', tag=tag)
 
@@ -214,7 +220,7 @@ def main():
                 model, items, device, res=cfg.resolution,
                 normalize_mean=cfg.IMAGENET_MEAN, normalize_std=cfg.IMAGENET_STD,
                 pad_frac=float(args.pad_frac), refine_max_frac=float(args.refine_max_frac),
-                log_tag='[zoom]', tag=tag,
+                decode_spec=decode_spec, log_tag='[zoom]', tag=tag,
             )
             report_coarse_to_fine(cf, log_tag='[zoom]', tag=tag)
 

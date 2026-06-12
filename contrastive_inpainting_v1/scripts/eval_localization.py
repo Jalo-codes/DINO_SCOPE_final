@@ -78,6 +78,8 @@ def _build_parser() -> argparse.ArgumentParser:
                    default=[-2.0, -1.0, 0.0, 1.0, 2.0])
     p.add_argument('--device', type=str, default='cuda')
     p.add_argument('--output_log', type=str, default=None)
+    from lab_utils.eval.decode_cli import add_decode_args
+    add_decode_args(p)
     return p
 
 
@@ -158,6 +160,10 @@ def main():
         log_line('[eval] localization DONE')
         return
 
+    from lab_utils.eval.decode_cli import decode_spec_from_args, decode_label
+    decode_spec = decode_spec_from_args(args)
+    log_line(f'[eval] decode={decode_label(decode_spec)}')
+
     do_swin = bool(args.swin) and has_bce   # swin needs the BCE gate
     for loader, tag in ((imd_loader, 'imd_val'), (casia_loader, 'casia_val')):
         if loader is None:
@@ -165,6 +171,7 @@ def main():
         _run_localization_eval(
             model, loader, device,
             cfg=cfg,
+            decode_spec=decode_spec,
             run_swin=do_swin,
             threshold_grid=tuple(args.loc_threshold_grid),
             opt_thresh=imd_opt_thresh,

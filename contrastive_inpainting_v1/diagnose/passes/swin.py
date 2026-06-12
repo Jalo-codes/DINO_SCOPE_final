@@ -80,6 +80,7 @@ def run_swin(
     imagenet_std,
     tau_win: float,
     gt_HW: np.ndarray = None,
+    decode_spec=None,
 ) -> Dict:
     """Run swin for one (scale, stride) combo."""
     W_src, H_src = source_image.size
@@ -131,9 +132,14 @@ def run_swin(
             z = out["contrastive"][0].detach().cpu().float().numpy()
             att = (out["pool_attention"][0].detach().cpu().float().numpy()
                    if out.get("pool_attention") is not None else None)
-            raw, _ = spherical_kmeans2(z, n_init=4)
-            attn_pred = polarity.polarity_attn(raw, att)
-            pred_grid = attn_pred.reshape(n, n)
+            if decode_spec is not None and getattr(decode_spec, 'method', 'kmeans') == 'graph':
+                from lab_utils.eval.partition import decode_deploy_mask
+                attn_pred, _ = decode_deploy_mask(z, decode_spec, attention=att,
+                                                  grid_hw=(n, n))
+            else:
+                raw, _ = spherical_kmeans2(z, n_init=4)
+                attn_pred = polarity.polarity_attn(raw, att)
+            pred_grid = np.asarray(attn_pred).reshape(n, n)
             pred_HW = project.patch_grid_to_pixel_mask(
                 pred_grid, bbox=(top, left, side, side), full_size=(H, W),
             )

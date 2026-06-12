@@ -1,9 +1,16 @@
-"""lab_utils.eval.partition — spherical k-means and silhouette gate.
+"""lab_utils.eval.partition — patch decoders (k-means + calibrated graph) and gates.
 
-Lifted from contrastive_test/core/partition.py (no functional changes).
+Original content lifted from contrastive_test/core/partition.py (spherical
+k-means + silhouette gate). Extended with ``graph_components_decode`` — a
+connected-components decode over a thresholded similarity graph that uses the
+*calibrated* contrastive geometry (same-region pairs ≥ tau_pos, cross-region
+pairs ≤ tau_neg) instead of re-deriving a 2-way split from scratch. See
+``GRAPH_DECODE_PLAN.md`` for the rationale and exact formulation.
 """
 
-from typing import Optional, Sequence, Tuple
+import dataclasses
+import math
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -478,4 +485,370 @@ def calibrate_gate_tau_null(
             float(sil_zs[~gt].mean() - sil_zs[gt].mean())
             if n_pos > 0 and n_neg > 0 else float('nan')
         ),
+    }
+
+
+# ── Calibrated graph-components decode ────────────────────────────────────────
+#
+# K-means(2) ignores the trained margins and is FORCED to split every image into
+# two clusters, so when no margin-respecting split exists it partitions along
+# semantics (large blobs swallowing background / surrounding objects; catastrophic
+# output when the image is clean-ish). The graph decode thresholds pairwise
+# similarity INSIDE the trained dead band [tau_neg, tau_pos] and takes connected
+# components, so:
+#   - joining the splice component needs an ABSOLUTE similarity bar (a pair the
+#     training pushed to ≤ tau_neg can't clear it) — bleed-resistant by design;
+#   - the number of components falls out automatically (multi-region for free);
+#   - zero accepted components = natural abstention (replaces the silhouette gate);
+#   - fully deterministic (no RNG, no n_init restarts, no prototype, no attention).
+
+
+def _infer_grid_hw(n: int) -> Optional[Tuple[int, int]]:
+    """Best-effort square grid (h, w) for N patches; None when N isn't square."""
+    s = int(round(math.sqrt(n)))
+    return (s, s) if s * s == n else None
+
+
+def _union_find_components(adj: np.ndarray) -> np.ndarray:
+    """Connected-component labels for a boolean (N, N) symmetric adjacency.
+
+    Plain array-based union-find with path compression (numpy only — scipy is
+    not a repo dependency). Isolated nodes form singleton components.
+    """
+    n = adj.shape[0]
+    parent = np.arange(n, dtype=np.int64)
+
+    def find(x: int) -> int:
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:          # path compression
+            parent[x], x = root, parent[x]
+        return root
+
+    # Only iterate the upper triangle of present edges.
+    src, dst = np.where(np.triu(adj, k=1))
+    for a, b in zip(src.tolist(), dst.tolist()):
+        ra, rb = find(int(a)), find(int(b))
+        if ra != rb:
+            parent[rb] = ra
+
+    roots = np.array([find(i) for i in range(n)], dtype=np.int64)
+    # Relabel roots to compact 0..k-1, ordered by first appearance (deterministic).
+    _, labels = np.unique(roots, return_inverse=True)
+    return labels.astype(np.int64)
+
+
+def graph_components_decode(
+    z: np.ndarray,                       # (N, D) L2-normalized
+    *,
+    tau_pos: float,
+    tau_neg: float,
+    grid_hw: Optional[Tuple[int, int]] = None,
+    s_edge: Optional[float] = None,      # None → (tau_pos + tau_neg) / 2
+    mutual_knn_k: int = 10,
+    r_spatial: Optional[int] = None,     # None → feature graph only (no spatial gate)
+    m_min: int = 4,
+    theta_w: Optional[float] = None,     # None → tau_pos - 0.05
+    theta_x: Optional[float] = None,     # None → (tau_pos + tau_neg) / 2
+    attention: Optional[np.ndarray] = None,
+    attention_polarity: bool = False,
+    min_patches: int = 16,
+) -> Tuple[np.ndarray, dict]:
+    """Connected-components decode over a calibrated similarity graph.
+
+    Args:
+        z:            (N, D) L2-normalized per-patch contrastive embeddings — the
+                      SAME array fed to ``spherical_kmeans2``.
+        tau_pos/tau_neg: trained margins (from the run config). They set the
+                      decode's default thresholds — do NOT freeze numeric values.
+        grid_hw:      (H, W) patch grid; inferred as square when None. Required
+                      only when ``r_spatial`` is set.
+        s_edge:       absolute similarity bar for an edge. Default mid-band
+                      (tau_pos + tau_neg) / 2.
+        mutual_knn_k: an edge (i, j) also requires j ∈ kNN(i) AND i ∈ kNN(j)
+                      (anti-chaining).
+        r_spatial:    if set, an edge also requires Chebyshev grid distance ≤ r.
+        m_min:        ignore components smaller than this (drops singletons/noise).
+        theta_w:      accept a component iff internal cohesion ≥ theta_w.
+                      Default tau_pos - 0.05.
+        theta_x:      accept a component iff its mean similarity to background
+                      ≤ theta_x (kills fragmented-background shards). Default
+                      mid-band.
+        attention:    (N,) per-patch BCE attention; only consulted when
+                      ``attention_polarity`` is True.
+        attention_polarity: pick background among large components by LOWEST mean
+                      attention (handles the >50%-splice regime). Default OFF.
+        min_patches:  images with fewer patches than this abstain outright.
+
+    Returns:
+        (mask, info) — mask is (N,) int {0,1}; 1 = accepted foreground (splice).
+        all-zeros = abstain (predicted single-class). ``info`` carries per-component
+        stats, the chosen parameters, background size, and ``abstained``.
+    """
+    z = np.ascontiguousarray(z, dtype=np.float32)
+    n = z.shape[0]
+    s_edge = float((tau_pos + tau_neg) / 2.0) if s_edge is None else float(s_edge)
+    theta_w = float(tau_pos - 0.05) if theta_w is None else float(theta_w)
+    theta_x = float((tau_pos + tau_neg) / 2.0) if theta_x is None else float(theta_x)
+
+    base_info = {
+        'method': 'graph', 'abstained': True, 'n_components': 0,
+        'background_size': 0, 'components': [],
+        's_edge': s_edge, 'theta_w': theta_w, 'theta_x': theta_x,
+        'mutual_knn_k': int(mutual_knn_k), 'r_spatial': r_spatial,
+        'm_min': int(m_min),
+    }
+    if n < int(min_patches):
+        return np.zeros(n, dtype=np.int64), base_info
+
+    # Rows should already be unit-norm; assert rather than silently renormalize.
+    norms = np.linalg.norm(z, axis=1)
+    if not np.allclose(norms, 1.0, atol=1e-3):
+        raise ValueError(
+            'graph_components_decode: z rows must be L2-normalized '
+            f'(norm range [{norms.min():.4f}, {norms.max():.4f}]).'
+        )
+
+    sim = z @ z.T                                    # (N, N) cosine
+    np.fill_diagonal(sim, -np.inf)                   # exclude self for kNN
+
+    # Mutual-kNN mask.
+    k = max(1, min(int(mutual_knn_k), n - 1))
+    knn_idx = np.argpartition(-sim, kth=k - 1, axis=1)[:, :k]
+    knn = np.zeros((n, n), dtype=bool)
+    rows = np.repeat(np.arange(n), k)
+    knn[rows, knn_idx.reshape(-1)] = True
+    mutual = knn & knn.T
+
+    np.fill_diagonal(sim, 1.0)                        # restore for thresholds/stats
+    edges = (sim >= s_edge) & mutual
+    np.fill_diagonal(edges, False)
+
+    if r_spatial is not None:
+        hw = grid_hw or _infer_grid_hw(n)
+        if hw is None:
+            raise ValueError(
+                f'graph_components_decode: r_spatial set but grid_hw is None and '
+                f'N={n} is not square — pass grid_hw explicitly.'
+            )
+        h, w = hw
+        rr = np.repeat(np.arange(h), w)
+        cc = np.tile(np.arange(w), h)
+        cheb = np.maximum(np.abs(rr[:, None] - rr[None, :]),
+                          np.abs(cc[:, None] - cc[None, :]))
+        edges &= (cheb <= int(r_spatial))
+
+    labels = _union_find_components(edges)
+    comp_ids, comp_sizes = np.unique(labels, return_counts=True)
+
+    # Background = largest component (deterministic tie-break: lowest min index).
+    max_size = int(comp_sizes.max())
+    tied = [int(c) for c, s in zip(comp_ids, comp_sizes) if int(s) == max_size]
+    if len(tied) == 1:
+        bg_id = tied[0]
+    else:
+        bg_id = min(tied, key=lambda c: int(np.where(labels == c)[0].min()))
+
+    if attention_polarity and attention is not None:
+        a = np.asarray(attention, dtype=np.float64).reshape(-1)
+        if a.shape[0] == n:
+            big = [int(c) for c, s in zip(comp_ids, comp_sizes)
+                   if int(s) >= 0.2 * n]
+            if len(big) >= 2:
+                bg_id = min(big, key=lambda c: float(a[labels == c].mean()))
+
+    bg_mask = labels == bg_id
+    bg_size = int(bg_mask.sum())
+
+    def _within(idx: np.ndarray) -> float:
+        if idx.size < 2:
+            return 1.0
+        sub = sim[np.ix_(idx, idx)]
+        iu = np.triu_indices(idx.size, k=1)
+        return float(sub[iu].mean())
+
+    components: List[Dict] = []
+    accept = np.zeros(n, dtype=bool)
+    bg_idx = np.where(bg_mask)[0]
+    for c, sz in zip(comp_ids.tolist(), comp_sizes.tolist()):
+        if c == bg_id:
+            continue
+        idx = np.where(labels == c)[0]
+        if idx.size < int(m_min):
+            continue
+        within = _within(idx)
+        cross = (float(sim[np.ix_(idx, bg_idx)].mean())
+                 if bg_idx.size else 0.0)
+        accepted = bool(within >= theta_w and cross <= theta_x)
+        components.append({
+            'size': int(idx.size), 'within': within, 'cross': cross,
+            'margin': within - cross, 'accepted': accepted,
+        })
+        if accepted:
+            accept[idx] = True
+
+    mask = accept.astype(np.int64)
+    info = dict(base_info)
+    info.update({
+        'abstained': bool(mask.sum() == 0),
+        'n_components': int(comp_ids.size),
+        'background_size': bg_size,
+        'components': components,
+        'n_accepted': int(sum(c['accepted'] for c in components)),
+    })
+    return mask, info
+
+
+# ── Decode dispatcher ─────────────────────────────────────────────────────────
+#
+# A single ``DecodeSpec`` threads through the eval suites. Default = k-means, so
+# existing behavior is byte-identical unless a caller opts into the graph decode.
+
+@dataclasses.dataclass(frozen=True)
+class DecodeSpec:
+    """Selects and parameterizes the patch decode used across the eval suites."""
+    method: str = 'kmeans'          # 'kmeans' | 'graph'
+    tau_pos: float = 0.55
+    tau_neg: float = 0.20
+    n_init: int = 4                 # k-means restarts
+    s_edge: Optional[float] = None
+    mutual_knn_k: int = 10
+    r_spatial: Optional[int] = None
+    m_min: int = 4
+    theta_w: Optional[float] = None
+    theta_x: Optional[float] = None
+    attention_polarity: bool = False
+
+    def _graph_kwargs(self) -> Dict:
+        return dict(
+            tau_pos=self.tau_pos, tau_neg=self.tau_neg, s_edge=self.s_edge,
+            mutual_knn_k=self.mutual_knn_k, r_spatial=self.r_spatial,
+            m_min=self.m_min, theta_w=self.theta_w, theta_x=self.theta_x,
+            attention_polarity=self.attention_polarity,
+        )
+
+
+def decode_oracle_labels(
+    z: np.ndarray,
+    spec: DecodeSpec = DecodeSpec(),
+    *,
+    grid_hw: Optional[Tuple[int, int]] = None,
+) -> np.ndarray:
+    """2-labeling for the ORACLE-polarity metric path.
+
+    The headline localization metric scores ``_oracle_polarity(labels, gt)`` —
+    the labeling and its complement, best-by-F1 — so absolute label identity
+    doesn't matter, only the partition. Returns (N,) int in {0, 1}.
+
+    - kmeans: ``spherical_kmeans2`` labels (arbitrary polarity).
+    - graph:  1 = accepted foreground, 0 = everything else. An abstain is all-0,
+              which oracle-polarity scores as an empty prediction (costs recall).
+    """
+    if spec.method == 'graph':
+        mask, _ = graph_components_decode(z, grid_hw=grid_hw, **spec._graph_kwargs())
+        return mask.astype(np.int64)
+    raw_labels, _ = spherical_kmeans2(z, n_init=spec.n_init)
+    return raw_labels
+
+
+def decode_deploy_mask(
+    z: np.ndarray,
+    spec: DecodeSpec = DecodeSpec(),
+    *,
+    attention: Optional[np.ndarray] = None,
+    grid_hw: Optional[Tuple[int, int]] = None,
+) -> Tuple[np.ndarray, dict]:
+    """Committed foreground (splice) mask for DEPLOYMENT — no GT available.
+
+    Returns (mask_bool (N,), info).
+
+    - kmeans: polarity from BCE attention (higher-attention cluster = splice);
+      falls back to the smaller-cluster rule when ``attention`` is None. This
+      reproduces the existing ``_select_cluster`` deployment heuristic.
+    - graph:  the accepted-components mask, already committed (no re-polarization
+      — re-applying an attention rule here could invert it).
+    """
+    if spec.method == 'graph':
+        mask, info = graph_components_decode(
+            z, grid_hw=grid_hw, attention=attention, **spec._graph_kwargs()
+        )
+        return mask.astype(bool), info
+    raw_labels, _ = spherical_kmeans2(z, n_init=spec.n_init)
+    if attention is not None:
+        a = np.asarray(attention, dtype=np.float64).reshape(-1)
+        m0 = (raw_labels == 0); m1 = (raw_labels == 1)
+        a0 = float(a[m0].mean()) if m0.any() else -np.inf
+        a1 = float(a[m1].mean()) if m1.any() else -np.inf
+        splice_label = 0 if a0 >= a1 else 1
+    else:
+        n0 = int((raw_labels == 0).sum()); n1 = int((raw_labels == 1).sum())
+        splice_label = 0 if n0 <= n1 else 1
+    mask = (raw_labels == splice_label)
+    return mask, {'method': 'kmeans', 'splice_label': int(splice_label)}
+
+
+def calibrate_graph_decode(
+    z_list: Sequence[np.ndarray],
+    gt_is_single: Sequence[bool],
+    *,
+    tau_pos: float,
+    tau_neg: float,
+    s_edge_grid: Optional[np.ndarray] = None,
+    base_spec: Optional[DecodeSpec] = None,
+    fallback_s_edge: Optional[float] = None,
+) -> Tuple[float, dict]:
+    """Calibrate the graph decode's ``s_edge`` on a calibration set.
+
+    Mirrors ``calibrate_gate_tau``: sweep ``s_edge`` and pick the value that
+    maximizes balanced accuracy of abstain-vs-single (abstain = empty mask) on
+    ``gt_is_single``. Returns (best_s_edge, info).
+    """
+    from lab_utils.errors import EvalError
+
+    if len(z_list) == 0:
+        if fallback_s_edge is None:
+            raise EvalError(
+                'calibrate_graph_decode: calibration set is empty and '
+                'fallback_s_edge is None.'
+            )
+        return float(fallback_s_edge), {
+            'per_s_edge': [], 'best_s_edge': float(fallback_s_edge),
+            'best_balanced_acc': float('nan'), 'used_fallback': True,
+        }
+
+    if s_edge_grid is None:
+        s_edge_grid = np.linspace(tau_neg + 0.05, tau_pos - 0.05, 21)
+    base = base_spec or DecodeSpec(method='graph', tau_pos=tau_pos, tau_neg=tau_neg)
+    gt = np.asarray(gt_is_single, dtype=bool)
+    n_pos = int(gt.sum())
+    n_neg = int((~gt).sum())
+
+    best_s, best_score = float(s_edge_grid[0]), -np.inf
+    best_tpr = best_tnr = float('nan')
+    per_s_edge = []
+    for s_edge in s_edge_grid:
+        spec = dataclasses.replace(base, method='graph', s_edge=float(s_edge))
+        pred_single = np.array([
+            graph_components_decode(z, grid_hw=_infer_grid_hw(z.shape[0]),
+                                    **spec._graph_kwargs())[0].sum() == 0
+            for z in z_list
+        ], dtype=bool)
+        tpr = float((pred_single & gt).sum()) / n_pos if n_pos > 0 else 1.0
+        tnr = float((~pred_single & ~gt).sum()) / n_neg if n_neg > 0 else 1.0
+        bacc = 0.5 * (tpr + tnr)
+        per_s_edge.append((float(s_edge), bacc, tpr, tnr))
+        if bacc > best_score:
+            best_score, best_s, best_tpr, best_tnr = bacc, float(s_edge), tpr, tnr
+
+    return best_s, {
+        'per_s_edge': per_s_edge,
+        'best_s_edge': best_s,
+        'best_balanced_acc': best_score,
+        'best_tpr': best_tpr,
+        'best_tnr': best_tnr,
+        'n_single': n_pos,
+        'n_two_class': n_neg,
+        's_edge_grid_min': float(np.min(s_edge_grid)),
+        's_edge_grid_max': float(np.max(s_edge_grid)),
     }

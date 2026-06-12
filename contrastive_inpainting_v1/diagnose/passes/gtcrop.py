@@ -33,7 +33,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from lab_utils.eval.partition import spherical_kmeans2
+from lab_utils.eval.partition import DecodeSpec, decode_oracle_labels
 
 from .. import polarity, project
 from . import common
@@ -56,6 +56,7 @@ def run_gtcrop(
     n_patch_per_side: int,
     imagenet_mean,
     imagenet_std,
+    decode_spec=None,
 ) -> Dict:
     """One forward at 448x448 on a square area-frac crop centered on GT centroid."""
     W_src, H_src = source_image.size
@@ -89,7 +90,7 @@ def run_gtcrop(
     bce_logit = (float(out["image_logit"][0].detach().cpu().item())
                  if out.get("image_logit") is not None else float("nan"))
 
-    raw, _ = spherical_kmeans2(z, n_init=4)
+    raw = decode_oracle_labels(z, decode_spec or DecodeSpec())
 
     # Patch-grid GT inside the crop (for ceil polarity only).
     # Sample the centre pixel of each patch cell within the crop.

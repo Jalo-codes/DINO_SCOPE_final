@@ -273,14 +273,19 @@ def _run_localization_eval(
     device: torch.device,
     *,
     cfg: Config,
+    decode_spec=None,
     log_tag: str = '[eval]',
     tag: str = '',
 ) -> Dict:
-    """Lean per-tier localization for the contrastive head (kmeans only).
+    """Lean per-tier localization for the contrastive head.
 
-    Spherical k-means(2) with attention-polarity, scored at pixel granularity
-    per area_tier (small/medium/large) plus an aggregate row.
+    Decode (k-means(2) with attention-polarity by default, or the calibrated
+    graph decode when ``decode_spec.method == 'graph'``), scored at pixel
+    granularity per area_tier (small/medium/large) plus an aggregate row.
     """
+    from lab_utils.eval.partition import DecodeSpec, decode_deploy_mask
+    if decode_spec is None:
+        decode_spec = DecodeSpec()
     multi_head.eval()
     n_side = cfg.resolution.num_patches_per_side
     psz = cfg.resolution.patch_size
@@ -316,8 +321,15 @@ def _run_localization_eval(
             z = z_b[i]                                              # (N, D)
             att = att_b[i].reshape(n_side, n_side) if att_b is not None else None
 
-            raw, _ = spherical_kmeans2(z, n_init=4)
-            km = polarity_attn(raw, att).reshape(n_side, n_side)
+            if decode_spec.method == 'graph':
+                fg, _ = decode_deploy_mask(
+                    z, decode_spec,
+                    attention=(att.reshape(-1) if att is not None else None),
+                    grid_hw=(n_side, n_side))
+                km = fg.astype(np.float64).reshape(n_side, n_side)
+            else:
+                raw, _ = spherical_kmeans2(z, n_init=4)
+                km = polarity_attn(raw, att).reshape(n_side, n_side)
 
             pred_px = _loc_patches_to_pixels(
                 km.reshape(-1).astype(np.float64), n_side, psz)
@@ -957,7 +969,30 @@ def _build_parser() -> argparse.ArgumentParser:
                         'override cfg.CONTRASTIVE_NORM_POWER)')
     p.add_argument('--contrastive_single_class_weight', type=float, default=None,
                    help='symmetric: very-low weight for full real images')
+    # ── In-training eval decode (separate from the loss; reuses cfg tau) ──────
+    p.add_argument('--eval_decode', choices=('kmeans', 'graph'), default='kmeans',
+                   help='Patch decode used by the per-epoch localization/zoom '
+                        'eval (default kmeans). "graph" uses the calibrated '
+                        'connected-components decode at cfg.TAU_POS/TAU_NEG.')
+    p.add_argument('--eval_graph_s_edge', type=float, default=None,
+                   help='graph eval: absolute edge similarity (default mid-band).')
+    p.add_argument('--eval_graph_knn', type=int, default=10,
+                   help='graph eval: mutual-kNN k.')
+    p.add_argument('--eval_graph_spatial', type=int, default=None,
+                   help='graph eval: Chebyshev grid radius for spatial-gated edges.')
     return p
+
+
+def _eval_decode_spec(args, cfg):
+    """Build the in-training eval DecodeSpec from args + cfg margins."""
+    from lab_utils.eval.partition import DecodeSpec
+    return DecodeSpec(
+        method=getattr(args, 'eval_decode', 'kmeans'),
+        tau_pos=float(cfg.TAU_POS), tau_neg=float(cfg.TAU_NEG),
+        s_edge=getattr(args, 'eval_graph_s_edge', None),
+        mutual_knn_k=int(getattr(args, 'eval_graph_knn', 10)),
+        r_spatial=getattr(args, 'eval_graph_spatial', None),
+    )
 
 
 @torch.no_grad()
@@ -1938,11 +1973,14 @@ def main():
                     if tag == 'imd_val':
                         imd_opt_thresh = metrics.get('opt_thresh')
 
-            # 2. Localization (Contrastive head, lean kmeans)
+            # 2. Localization (Contrastive head — decode per --eval_decode)
             if args.contrastive_dim > 0:
+                _eval_dspec = _eval_decode_spec(args, cfg)
                 for loader, _, tag in eval_sources:
                     if loader is None: continue
-                    _run_localization_eval(eval_model, loader, device, cfg=cfg, log_tag='[eval]', tag=tag)
+                    _run_localization_eval(eval_model, loader, device, cfg=cfg,
+                                           decode_spec=_eval_dspec,
+                                           log_tag='[eval]', tag=tag)
 
             # 3. Dense Localization (Patch BCE head)
             if patch_active:
@@ -1958,7 +1996,8 @@ def main():
                         eval_model, zoom_items, device, res=cfg.resolution,
                         cov_range=tuple(args.val_zoom_cov), seed=f'zoomval|{tag}',
                         normalize_mean=cfg.IMAGENET_MEAN, normalize_std=cfg.IMAGENET_STD,
-                        skip_oracle=True, log_tag='[eval]', tag=tag,
+                        skip_oracle=True, decode_spec=_eval_decode_spec(args, cfg),
+                        log_tag='[eval]', tag=tag,
                     )
                     report_zoom_eval(
                         zsamples, condensed=True, log_tag='[eval]', tag=tag,

@@ -137,12 +137,15 @@ def _process_one_image(
     W_src, H_src = source_image.size
     H, W = int(H_src), int(W_src)
 
+    from lab_utils.eval.decode_cli import decode_spec_from_args
+    decode_spec = decode_spec_from_args(args)
+
     # ------- full pass (all images; ceil only when gt_HW present) -------
     full_out = pass_full.run_full(
         model, source_image, device,
         image_size=image_size, n_patch_per_side=n_patch,
         imagenet_mean=cfg.IMAGENET_MEAN, imagenet_std=cfg.IMAGENET_STD,
-        gt_HW=gt_HW,
+        gt_HW=gt_HW, decode_spec=decode_spec,
     )
     row["full_bce_logit"] = full_out["full_bce_logit"]
     row["full_pool_attention_mean"] = full_out["full_pool_attention_mean"]
@@ -172,6 +175,7 @@ def _process_one_image(
                     area_frac=float(area), gt_HW=gt_HW,
                     image_size=image_size, n_patch_per_side=n_patch,
                     imagenet_mean=cfg.IMAGENET_MEAN, imagenet_std=cfg.IMAGENET_STD,
+                    decode_spec=decode_spec,
                 )
             except Exception as exc:
                 log_line(
@@ -207,6 +211,7 @@ def _process_one_image(
                 imagenet_mean=cfg.IMAGENET_MEAN, imagenet_std=cfg.IMAGENET_STD,
                 tau_win=float(args.tau_win),
                 gt_HW=gt_HW if gt_HW is not None else np.zeros((H, W), dtype=bool),
+                decode_spec=decode_spec,
             )
         except Exception as exc:
             log_line(
@@ -278,6 +283,8 @@ def main():
     p.add_argument("--probe_image_w", type=int, default=384)
     p.add_argument("--probe_image_h", type=int, default=256)
     p.add_argument("--seed", type=int, default=0)
+    from lab_utils.eval.decode_cli import add_decode_args
+    add_decode_args(p)
     args = p.parse_args()
     from contrastive_inpainting_v1.pipeline.cli import apply_path_defaults
     apply_path_defaults(args)

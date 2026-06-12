@@ -22,7 +22,7 @@ import torch.nn as nn
 from PIL import Image
 from torch.utils.data import DataLoader
 
-from lab_utils.eval.partition import spherical_kmeans2
+from lab_utils.eval.partition import DecodeSpec, decode_oracle_labels
 from lab_utils.eval.sliding_window import tile_window_contrastive_masks
 from lab_utils.data.resolution import (
     Resolution, resize_only, resize_only_mask, oracle_mask_crop,
@@ -396,6 +396,7 @@ def collect_localization_samples(
     swin_normalize_mean: Tuple[float, float, float] = _DEFAULT_NORMALIZE_MEAN,
     swin_normalize_std:  Tuple[float, float, float] = _DEFAULT_NORMALIZE_STD,
     res: Optional[Resolution] = None,
+    decode_spec: DecodeSpec = DecodeSpec(),
     log_tag: str = '[eval]',
     tag: str = '',
 ) -> List[_LocSample]:
@@ -479,12 +480,12 @@ def collect_localization_samples(
                 area = float(meta_list[i].get('blob_area_actual',
                                               gt_i.mean() if len(gt_i) else 0.0))
 
-            # Full-image partition under ORACLE polarity. The k-means separation
-            # is BCE-independent; we then take the cluster→splice labeling that
-            # best matches GT (we do NOT predict polarity — it's the one thing
-            # we legitimately oracle at eval). This fully decouples the
-            # localization metric from the image head's attention.
-            raw_labels, _ = spherical_kmeans2(z_full_np[i], n_init=4)
+            # Full-image partition under ORACLE polarity. The decode (k-means or
+            # calibrated graph) is BCE-independent; we then take the
+            # cluster→splice labeling that best matches GT (we do NOT predict
+            # polarity — it's the one thing we legitimately oracle at eval). This
+            # fully decouples the localization metric from the image head.
+            raw_labels = decode_oracle_labels(z_full_np[i], decode_spec)
             full_pred, f1_f, iou_f, prec_f, rec_f, pred_frac_f = _oracle_polarity(
                 raw_labels, gt_i
             )
@@ -596,6 +597,7 @@ def collect_localization_samples(
                             scale=tile_scale,
                             stride_frac=float(swin_stride_frac),
                             inner_batch_size=int(swin_inner_batch),
+                            decode_spec=decode_spec,
                             bce_gate_threshold=(
                                 float(swin_bce_gate_threshold)
                                 if swin_bce_gate_threshold is not None else None
@@ -1126,6 +1128,7 @@ def collect_coarse_to_fine_samples(
     pad_frac: float = 0.25,
     refine_max_frac: float = 0.40,
     corruption_spec: Optional[CorruptionSpec] = None,
+    decode_spec: DecodeSpec = DecodeSpec(),
     log_tag: str = '[eval]',
     tag: str = '',
 ) -> List[_CFSample]:
@@ -1172,7 +1175,7 @@ def collect_coarse_to_fine_samples(
         z1 = _embed_pil(model, src, res, device, normalize_mean, normalize_std)
         if z1 is None:
             continue
-        raw1, _ = spherical_kmeans2(z1, n_init=4)
+        raw1 = decode_oracle_labels(z1, decode_spec)
         cpx_a = _patches_to_pixels((raw1 == 1), P, res.patch_size)
         cpx_b = ~cpx_a
         c_f1, c_iou, c_prec, c_rec = _oracle_pixel(cpx_a, cpx_b, gt_px)
@@ -1189,7 +1192,7 @@ def collect_coarse_to_fine_samples(
             z2 = _embed_pil(model, src.crop((x0, y0, x1, y1)), res, device,
                             normalize_mean, normalize_std)
             if z2 is not None:
-                raw2, _ = spherical_kmeans2(z2, n_init=4)
+                raw2 = decode_oracle_labels(z2, decode_spec)
                 ref_a = _place_fine_in_pixel_frame((raw2 == 1), bbox, res)
                 ref_b = _place_fine_in_pixel_frame((raw2 == 0), bbox, res)
                 r_f1, r_iou, r_prec, r_rec = _oracle_pixel(ref_a, ref_b, gt_px)
@@ -1503,11 +1506,12 @@ def _embed_logit_pil(
 
 def _oracle_pixel_from_z(
     z_np: Optional[np.ndarray], gt_px: Optional[np.ndarray], res: Resolution,
+    decode_spec: DecodeSpec = DecodeSpec(),
 ) -> Tuple[float, float]:
-    """k-means(2) → oracle-polarity PIXEL (f1, iou) vs gt_px (bool, frame-sized)."""
+    """Decode → oracle-polarity PIXEL (f1, iou) vs gt_px (bool, frame-sized)."""
     if z_np is None or gt_px is None or not gt_px.any():
         return 0.0, 0.0
-    raw, _ = spherical_kmeans2(z_np, n_init=4)
+    raw = decode_oracle_labels(z_np, decode_spec)
     P, ps = res.num_patches_per_side, res.patch_size
     px_a = _patches_to_pixels((raw == 1), P, ps)
     f1, iou, _, _ = _oracle_pixel(px_a, ~px_a, gt_px)
@@ -1558,6 +1562,7 @@ def collect_zoom_eval_samples(
     normalize_std:  Tuple[float, float, float] = _DEFAULT_NORMALIZE_STD,
     oracle_jitter: float = 0.15,
     skip_oracle: bool = False,
+    decode_spec: DecodeSpec = DecodeSpec(),
     log_tag: str = '[eval]',
     tag: str = '',
 ) -> List[_ZoomSample]:
@@ -1596,7 +1601,7 @@ def collect_zoom_eval_samples(
 
         # FULL frame.
         z_f, logit_f = _embed_logit_pil(model, src, res, device, normalize_mean, normalize_std)
-        f1_f, iou_f = _oracle_pixel_from_z(z_f, gt_full, res)
+        f1_f, iou_f = _oracle_pixel_from_z(z_f, gt_full, res, decode_spec)
 
         # NATURAL zoom (random position).
         cz, mz, realized = _seeded_natural_crop(src, mask, res, target_cov, rng)
@@ -1604,7 +1609,7 @@ def collect_zoom_eval_samples(
             continue
         gt_z = np.asarray(resize_only_mask(mz, res).convert('L')) > 127
         z_z, logit_z = _embed_logit_pil(model, cz, res, device, normalize_mean, normalize_std)
-        f1_z, iou_z = _oracle_pixel_from_z(z_z, gt_z, res)
+        f1_z, iou_z = _oracle_pixel_from_z(z_z, gt_z, res, decode_spec)
 
         # ORACLE zoom (mask-centered into the object).
         if skip_oracle:
@@ -1618,7 +1623,7 @@ def collect_zoom_eval_samples(
             if oc.valid and oc.mask is not None:
                 gt_o = np.asarray(oc.mask.convert('L')) > 127
                 z_o, _ = _embed_logit_pil(model, oc.image, res, device, normalize_mean, normalize_std)
-                f1_o, iou_o = _oracle_pixel_from_z(z_o, gt_o, res)
+                f1_o, iou_o = _oracle_pixel_from_z(z_o, gt_o, res, decode_spec)
             else:
                 f1_o, iou_o = f1_z, iou_z   # couldn't crop (empty mask) — fall back to zoom
 

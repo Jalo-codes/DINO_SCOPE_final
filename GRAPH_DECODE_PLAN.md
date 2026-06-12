@@ -1,5 +1,26 @@
 # Calibrated-Graph Decode — implementation plan
 
+> **Implementation status (built).** Core decode, dispatcher, calibration, and
+> the `--decode`/`--eval_decode` flag are implemented and threaded through the
+> eval suites. Files:
+> - `lab_utils/eval/partition.py` — `graph_components_decode`, `DecodeSpec`,
+>   `decode_oracle_labels`, `decode_deploy_mask`, `calibrate_graph_decode`.
+> - `lab_utils/eval/decode_cli.py` — `add_decode_args` / `decode_spec_from_args`
+>   (shared argparse wiring; default `kmeans` so behavior is unchanged).
+> - `lab_utils/tests/test_graph_decode.py` — 11 synthetic tests (all green).
+> - Threaded through: `localization.py` (oracle metric, coarse→fine, zoom),
+>   `sliding_window.py` (both window funcs), the three `diagnose/passes/*`,
+>   `scripts/diagnose.py`, `scripts/eval_zoom_recovery.py`,
+>   `scripts/swin_outlier_decode.py` (graph as a comparison strategy), and the
+>   trainer's per-epoch eval (`--eval_decode graph`).
+> - k-means path kept byte-identical (default `DecodeSpec()` == k-means).
+> Not done: `eval_graph_decode.py` standalone (the `graph` strategy in
+> `swin_outlier_decode.py` covers the comparison); swin Phase-4 deep integration
+> beyond per-window decode; `eval_localization.py` has a *pre-existing* unrelated
+> bug (calls `_run_localization_eval` with swin kwargs it never accepted).
+
+
+
 Replace k-means(2) patch decoding with a connected-components decode over a
 thresholded similarity graph. The contrastive loss trains an explicit, calibrated
 geometry — same-region pairs ≥ `TAU_POS`, cross-region pairs ≤ `TAU_NEG` — leaving

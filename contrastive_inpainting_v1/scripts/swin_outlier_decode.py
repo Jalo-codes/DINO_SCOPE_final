@@ -195,7 +195,9 @@ _BLIND = {
     'gap':    _gap_thr,
 }
 # Contrastive-embedding decodes (need the 'contrastive' head).
-_CONTRASTIVE_STRATS = ['kmeans', 'oracle'] + list(_BLIND.keys())
+#   graph : calibrated connected-components decode (committed foreground) — the
+#           comparison target for k-means; bleed-resistant, abstains naturally.
+_CONTRASTIVE_STRATS = ['kmeans', 'graph', 'oracle'] + list(_BLIND.keys())
 # Supervised patch-BCE decodes (need the 'patch_logit' head).
 #   patchbce        : sigmoid(logit) >= 0.5  (== logit >= 0)   [deployed]
 #   patchbce_oracle : best logit threshold vs GT               [CEILING]
@@ -212,7 +214,8 @@ def _model_strategies(model) -> List[str]:
     return strats
 
 
-def _decode_masks(z, att, pl, gt_win_flat, n, strategies, kmeans_init=4):
+def _decode_masks(z, att, pl, gt_win_flat, n, strategies, kmeans_init=4,
+                  graph_spec=None):
     """strategy → (n,n) bool mask. gt_win_flat used only by the oracle decodes.
 
     Contrastive decodes read ``z``/``att``; patch decodes read ``pl`` (per-patch
@@ -225,6 +228,10 @@ def _decode_masks(z, att, pl, gt_win_flat, n, strategies, kmeans_init=4):
         if 'kmeans' in strategies:
             raw, _ = spherical_kmeans2(z, n_init=kmeans_init)
             out['kmeans'] = _polarity.polarity_attn(raw, att).reshape(n, n)
+        if 'graph' in strategies and graph_spec is not None:
+            from lab_utils.eval.partition import decode_deploy_mask
+            fg, _ = decode_deploy_mask(z, graph_spec, attention=att, grid_hw=(n, n))
+            out['graph'] = fg.astype(bool).reshape(n, n)
         score = _outlier_score(z, att)
         if 'oracle' in strategies:
             out['oracle'] = (score >= _oracle_thr(score, gt)).reshape(n, n)
@@ -279,7 +286,8 @@ def _forward(model, crops_t, device, inner=8):
 # ── per-image processing for one scale ──────────────────────────────────────
 
 def _process(model, source, gt_HW, *, scale, stride, gate, localized,
-             n, T, normalize, device, inner, kmeans_init, strategies):
+             n, T, normalize, device, inner, kmeans_init, strategies,
+             graph_spec=None):
     W_src, H_src = source.size
     out: Dict[str, Dict[str, Tuple[float, float, float]]] = {}
 
@@ -295,7 +303,7 @@ def _process(model, source, gt_HW, *, scale, stride, gate, localized,
         zf[0] if zf is not None else None,
         af[0] if af is not None else None,
         plf[0] if plf is not None else None,
-        gt_full_nn.reshape(-1), n, strategies, kmeans_init)
+        gt_full_nn.reshape(-1), n, strategies, kmeans_init, graph_spec)
     out['FULL_FRAME'] = {
         s: _pr_iou(_project.patch_grid_to_pixel_mask(
             fmasks[s], bbox=(0, 0, H_src, W_src), full_size=(H_src, W_src)), gt_HW)
@@ -326,7 +334,7 @@ def _process(model, source, gt_HW, *, scale, stride, gate, localized,
             zw[k] if zw is not None else None,
             aw[k] if aw is not None else None,
             plw[k] if plw is not None else None,
-            gt_win, n, strategies, kmeans_init)
+            gt_win, n, strategies, kmeans_init, graph_spec)
         for strat in strategies:
             win_masks[strat].append((d[strat], (t, l, s, s)))
         cap = _capture(gt_HW, t, l, s)
@@ -378,6 +386,20 @@ def main():
     p.add_argument('--kmeans_init', type=int, default=4)
     p.add_argument('--inner_batch_size', type=int, default=8)
     p.add_argument('--output_log', type=str, default=None)
+    # Graph decode is always compared alongside k-means (strategy 'graph');
+    # these tune it. tau_pos/tau_neg should match the trained margins.
+    p.add_argument('--tau_pos', type=float, default=0.55,
+                   help='graph decode: same-region cohesion floor (match trained value).')
+    p.add_argument('--tau_neg', type=float, default=0.20,
+                   help='graph decode: cross-region separation ceiling.')
+    p.add_argument('--graph_s_edge', type=float, default=None,
+                   help='graph decode: absolute edge similarity (default mid-band).')
+    p.add_argument('--graph_knn', type=int, default=10,
+                   help='graph decode: mutual-kNN k.')
+    p.add_argument('--graph_spatial', type=int, default=None,
+                   help='graph decode: Chebyshev grid radius for spatial-gated edges.')
+    p.add_argument('--no_graph', action='store_true', default=False,
+                   help='Disable the graph strategy (k-means + score decodes only).')
     args = p.parse_args()
     from contrastive_inpainting_v1.pipeline.cli import apply_path_defaults
     apply_path_defaults(args)
@@ -420,6 +442,13 @@ def main():
         contrastive_dim=c_dim, pool_hidden=p_hidden, patch_bce=has_patch, device=device)
     model.load_state_dict(sd); model.eval()
     strategies = _model_strategies(model)
+    from lab_utils.eval.partition import DecodeSpec
+    graph_spec = DecodeSpec(
+        method='graph', tau_pos=float(args.tau_pos), tau_neg=float(args.tau_neg),
+        s_edge=args.graph_s_edge, mutual_knn_k=int(args.graph_knn),
+        r_spatial=args.graph_spatial)
+    if args.no_graph and 'graph' in strategies:
+        strategies = [s for s in strategies if s != 'graph']
     if not strategies:
         log_line('[loc] ERROR: checkpoint exposes no localization head; abort')
         return
@@ -448,7 +477,7 @@ def main():
                                gate=args.bce_gate_threshold, localized=args.localized,
                                n=n, T=T, normalize=normalize, device=device,
                                inner=args.inner_batch_size, kmeans_init=args.kmeans_init,
-                               strategies=strategies)
+                               strategies=strategies, graph_spec=graph_spec)
                 for v in views:
                     if v not in res:
                         continue

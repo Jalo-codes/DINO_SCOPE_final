@@ -25,7 +25,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from lab_utils.eval.partition import spherical_kmeans2
+from lab_utils.eval.partition import DecodeSpec, decode_oracle_labels
 
 from .. import polarity, project
 from . import common
@@ -42,6 +42,7 @@ def run_full(
     imagenet_mean,
     imagenet_std,
     gt_HW: Optional[np.ndarray] = None,
+    decode_spec=None,
 ) -> Dict:
     """One forward at 448x448, partition, project both polarities to pixels."""
     W_src, H_src = source_image.size  # PIL is (W, H)
@@ -63,7 +64,7 @@ def run_full(
     bce_logit = (float(out["image_logit"][0].detach().cpu().item())
                  if out.get("image_logit") is not None else float("nan"))
 
-    raw, _ = spherical_kmeans2(z, n_init=4)
+    raw = decode_oracle_labels(z, decode_spec or DecodeSpec())
     n = int(n_patch_per_side)
 
     # Build patch-grid GT (used only by ceil — no leakage to the row's
