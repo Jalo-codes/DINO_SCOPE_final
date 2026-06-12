@@ -1,0 +1,36 @@
+# Results and checkpoints - never commit these
+results/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Data
+
+*.h5
+*.npy
+*.npz
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.egg-info/
+dist/
+.eggs/
+
+# Jupyter - strip outputs before committing
+.ipynb_checkpoints/
+
+# Colab
+*.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.d
+
+#claude
+.claude/

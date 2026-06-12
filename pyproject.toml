@@ -1,0 +1,21 @@
+# DINO_SCOPE_final — cleaned contrastive inpainting pipeline.
+#
+# Not a setuptools project. This file exists so `pytest` (and similar tools)
+# can discover both test trees from the repo root with one command:
+#
+#     pytest
+#
+
+[tool.pytest.ini_options]
+testpaths = [
+    "lab_utils/tests",
+    "contrastive_inpainting_v1/tests",
+]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-ra --strict-markers"
+markers = [
+    "needs_data: integration test that requires /media/ssd datasets",
+    "needs_gpu: integration test that requires CUDA",
+]
