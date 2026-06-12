@@ -474,6 +474,113 @@ def index_inpaint_triplet(
     return train_items, val_items
 
 
+def index_anyedit(
+    root_dir: str,
+    valid_exts: tuple,
+    *,
+    source: str = 'anyedit',
+    val_split: float = 0.10,
+    split_seed: int = 42,
+) -> Tuple[List[Dict], List[Dict]]:
+    """Index the AnyEdit dataset.
+
+    Layout::
+
+        root_dir/images/   real + edited pairs; real files contain '_real' or
+                           '_original' in the stem, edited files contain '_fake'
+                           or '_modified'.
+        root_dir/masks/    binary masks matched to the edited image by cleaned
+                           base name (extension and _real/_fake/… suffix stripped).
+
+    Each matched (real, fake) pair yields:
+        - kind='imd_real'     for the pristine original
+        - kind='casia_splice' for the edited image (no real_path — no paste
+          needed since AnyEdit applies a localised edit, not a full-image VAE pass)
+
+    Train/val split by cleaned base id. Returns (train_items, val_items).
+    """
+    train_items: List[Dict] = []
+    val_items:   List[Dict] = []
+
+    if not root_dir or not os.path.isdir(root_dir):
+        log_line(f'[data] WARN: anyedit root not found: {root_dir!r}')
+        return train_items, val_items
+
+    img_dir  = os.path.join(root_dir, 'images')
+    mask_dir = os.path.join(root_dir, 'masks')
+    for label, d in (('images', img_dir), ('masks', mask_dir)):
+        if not os.path.isdir(d):
+            log_line(f'[data] WARN: anyedit missing {label}/ dir: {d!r}')
+            return train_items, val_items
+
+    reals: Dict[str, str] = {}
+    fakes: Dict[str, str] = {}
+    for name in sorted(os.listdir(img_dir)):
+        full = os.path.join(img_dir, name)
+        if not os.path.isfile(full):
+            continue
+        if os.path.splitext(name)[1].lower() not in valid_exts:
+            continue
+        stem = os.path.splitext(name.lower())[0]
+        base = _inpaint_clean_name(name)
+        if stem.endswith('_real') or stem.endswith('_original'):
+            reals[base] = full
+        elif stem.endswith('_fake') or stem.endswith('_modified'):
+            fakes[base] = full
+
+    mask_exts = tuple(set(valid_exts) | {'.png'})
+    masks: Dict[str, str] = {}
+    for name in sorted(os.listdir(mask_dir)):
+        full = os.path.join(mask_dir, name)
+        if not os.path.isfile(full):
+            continue
+        if os.path.splitext(name)[1].lower() not in mask_exts:
+            continue
+        masks[_inpaint_clean_name(name)] = full
+
+    bases = sorted(set(reals) & set(fakes))
+    if not bases:
+        log_line(
+            f'[data] anyedit: no matched (real, fake) pairs in {img_dir!r} '
+            f'(reals={len(reals)} fakes={len(fakes)})'
+        )
+        return train_items, val_items
+
+    split_rng = random.Random(int(split_seed))
+    shuffled  = list(bases)
+    split_rng.shuffle(shuffled)
+    val_bases = set(shuffled[: int(len(shuffled) * float(val_split))])
+
+    n_masked = 0
+    for base in bases:
+        bucket = val_items if base in val_bases else train_items
+        mask_path = masks.get(base)
+        if mask_path is not None:
+            n_masked += 1
+        bucket.append({
+            'img':     reals[base],
+            'mask':    None,
+            'kind':    'imd_real',
+            'case_id': f'{source}_{base}',
+            'source':  source,
+        })
+        bucket.append({
+            'img':     fakes[base],
+            'mask':    mask_path,
+            'kind':    'casia_splice',
+            'case_id': f'{source}_{base}',
+            'source':  source,
+        })
+
+    log_line(
+        f'[data] anyedit: train={len(train_items)} val={len(val_items)} '
+        f'pairs={len(bases)} masked={n_masked}'
+    )
+    if n_masked < len(bases):
+        log_line(f'[data] anyedit WARN: {len(bases) - n_masked} pairs missing a mask.')
+    return train_items, val_items
+
+
 # ── BFree (COCO-anchored SD2.1 inpainting; diffcat=bbox-mask, samecat=exact) ──
 
 def _normalize_dir_name(name: str) -> str:

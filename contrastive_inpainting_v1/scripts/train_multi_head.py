@@ -695,6 +695,10 @@ def _build_parser() -> argparse.ArgumentParser:
                         'SD2.1_inpainted_{diffcat,samecat}, masks|mask, bbox; or a '
                         'parent containing it). Joins the training mix; held-out '
                         'val slice used for loc eval.')
+    p.add_argument('--anyedit_root',      type=str, default=None,
+                   help='AnyEdit root (dir holding images/{*_real,*_fake} and masks/). '
+                        'Joins the training mix; held-out val slice used for loc eval. '
+                        'No paste: edits are already localised (unlike SD-inpaint sources).')
     # Train/val split control — mirrors train_image_bce. The flip (train on
     # CASIA, validate on IMD) puts CASIA's tiny-heavy splice distribution into
     # TRAIN and holds IMD out as the OOD check.
@@ -1140,6 +1144,7 @@ def main():
         coco_inpaint_root=args.coco_inpaint_root,
         sagid_root=args.sagid_root,
         bfree_root=args.bfree_root,
+        anyedit_root=args.anyedit_root,
         imd_train=not args.imd_val_only,
         casia_train=args.casia_train,
     )
@@ -1157,6 +1162,7 @@ def main():
         (args.coco_inpaint_root, 'coco_inpaint', '--coco_inpaint_root'),
         (args.sagid_root, 'sagid', '--sagid_root'),
         (args.bfree_root, 'bfree', '--bfree_root'),
+        (args.anyedit_root, 'anyedit', '--anyedit_root'),
     ):
         if _root and _all_src.get(_src, 0) == 0:
             log_line(f'[cfg] WARN: {_flag}={_root!r} resolved but indexed 0 items '

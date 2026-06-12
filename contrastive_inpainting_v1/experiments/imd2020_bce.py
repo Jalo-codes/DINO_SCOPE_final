@@ -15,6 +15,7 @@ from lab_utils.data.indexer import (
     index_casia_exported,
     index_indoor_dataset,
     index_inpaint_triplet,
+    index_anyedit,
     index_bfree,
     build_indoor_real_items,
     sample_indoor_real_subset,
@@ -58,6 +59,8 @@ class IMD2020BCESpec:
     # BFree: <root>/{COCO_real_512, SD2.1_inpainted_diffcat,
     #                SD2.1_inpainted_samecat, masks|mask, bbox}
     bfree_root:        Optional[str] = None
+    # AnyEdit: <root>/images/{*_real.*,*_fake.*}  <root>/masks/
+    anyedit_root:      Optional[str] = None
     indoor_holdout:   str  = 'unclassified'
     imd_val_split:    float = 0.10
     imd_split_seed:   int   = 42
@@ -131,6 +134,15 @@ class IMD2020BCESpec:
         if self.bfree_root:
             t, v = index_bfree(
                 self.bfree_root, exts, source='bfree',
+                val_split=self.inpaint_val_split,
+                split_seed=self.inpaint_split_seed,
+            )
+            train_items.extend(t)
+            val_items.extend(v)
+
+        if self.anyedit_root:
+            t, v = index_anyedit(
+                self.anyedit_root, exts, source='anyedit',
                 val_split=self.inpaint_val_split,
                 split_seed=self.inpaint_split_seed,
             )
