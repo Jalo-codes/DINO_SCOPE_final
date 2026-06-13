@@ -114,6 +114,27 @@ def multi_mask_tint(
     return out
 
 
+def make_component_overlay(src_np, info, n, viz_hw):
+    labels_np = info.get('labels')
+    if labels_np is None:
+        return src_np
+    
+    comp_ids, comp_sizes = np.unique(labels_np, return_counts=True)
+    bg_id = info.get('background_id')
+    m_min = info.get('m_min', 4)
+    
+    color_map = {}
+    for comp in info.get('components', []):
+        cid = comp['comp_id']
+        color_map[cid] = (0, 255, 0) if comp['accepted'] else (255, 0, 0)
+        
+    for cid, sz in zip(comp_ids.tolist(), comp_sizes.tolist()):
+        if cid != bg_id and sz < m_min:
+            color_map[int(cid)] = (120, 120, 120)
+            
+    return multi_mask_tint(src_np, labels_np.reshape(n, n), viz_hw, color_map)
+
+
 def main():
     args = _build_parser().parse_args()
     from contrastive_inpainting_v1.pipeline.cli import apply_path_defaults
@@ -234,12 +255,12 @@ def main():
 
             g_fg, g_info = decode_deploy_mask(z_np, graph_spec, attention=att_np, grid_hw=(n, n))
             panels.append((_glabel('Graph', g_info),
-                           mask_tint(src_np, g_fg.reshape(n, n), viz_hw, (255, 90, 0))))
+                           make_component_overlay(src_np, g_info, n, viz_hw)))
 
             if graph_sp_spec is not None:
                 gs_fg, gs_info = decode_deploy_mask(z_np, graph_sp_spec, attention=att_np, grid_hw=(n, n))
                 panels.append((_glabel(f'Graph+sp{args.graph_spatial}', gs_info),
-                               mask_tint(src_np, gs_fg.reshape(n, n), viz_hw, (255, 0, 200))))
+                               make_component_overlay(src_np, gs_info, n, viz_hw)))
 
             if args.granular:
                 # 1. Print per-component stats with the failing gate to stdout
