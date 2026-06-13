@@ -28,7 +28,6 @@ from lab_utils.eval.localization import (
     _patches_to_pixels,
     _load_gt_pixel_mask,
     _mask_metrics,
-    _is_real,
 )
 from contrastive_inpainting_v1.configs.base import Config
 from contrastive_inpainting_v1.experiments.imd2020_bce import IMD2020BCESpec
