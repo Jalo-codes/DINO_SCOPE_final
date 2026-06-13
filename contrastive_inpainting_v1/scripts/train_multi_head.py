@@ -1650,7 +1650,8 @@ def main():
         _n_batches = max(1, math.ceil(per_rank_samples / args.batch_size))
         _pbar = tqdm(enumerate(train_loader), total=_n_batches,
                      desc=f'Epoch {epoch}/{args.num_epochs-1}',
-                     dynamic_ncols=True, leave=True)
+                     dynamic_ncols=True, leave=True,
+                     miniters=max(1, _n_batches // 20))
 
         for step, batch in _pbar:
             if batch is None:
