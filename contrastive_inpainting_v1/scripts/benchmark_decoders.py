@@ -23,7 +23,7 @@ from lab_utils.data.dataset import LabDataset
 from lab_utils.data.loaders import LoaderConfig, build_eval_loader
 from lab_utils.train.checkpoint import load as ckpt_load
 from lab_utils.model.multi_head_detector import build_multi_head_detector
-from lab_utils.eval.partition import DecodeSpec, decode_deploy_mask, spherical_kmeans2
+from lab_utils.eval.partition import DecodeSpec, decode_deploy_mask, spherical_kmeans2, polarity_attn
 from lab_utils.eval.localization import (
     _patches_to_pixels,
     _load_gt_pixel_mask,
@@ -31,7 +31,7 @@ from lab_utils.eval.localization import (
 )
 from contrastive_inpainting_v1.configs.base import Config
 from contrastive_inpainting_v1.experiments.imd2020_bce import IMD2020BCESpec
-from contrastive_inpainting_v1.diagnose.polarity import polarity_attn
+
 from contrastive_inpainting_v1.scripts.train_multi_head import _SPLICE_KINDS, _subsample_items
 
 

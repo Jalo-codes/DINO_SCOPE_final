@@ -26,10 +26,10 @@ import torchvision.transforms.functional as TF
 from lab_utils.data.sampling import deterministic_subsample
 from lab_utils.train.checkpoint import load as ckpt_load
 from lab_utils.model.multi_head_detector import build_multi_head_detector
-from lab_utils.eval.partition import DecodeSpec, decode_deploy_mask, spherical_kmeans2
+from lab_utils.eval.partition import DecodeSpec, decode_deploy_mask, spherical_kmeans2, polarity_attn
 from lab_utils.eval.sliding_window import _square_crop_boxes
 from lab_utils.viz import heatmap_rgb, overlay_blend, mask_tint, save_composite
-from contrastive_inpainting_v1.diagnose.polarity import polarity_attn
+
 
 from contrastive_inpainting_v1.configs.base import Config
 from contrastive_inpainting_v1.experiments.imd2020_bce import IMD2020BCESpec

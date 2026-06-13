@@ -855,3 +855,22 @@ def calibrate_graph_decode(
         's_edge_grid_min': float(np.min(s_edge_grid)),
         's_edge_grid_max': float(np.max(s_edge_grid)),
     }
+
+
+def polarity_attn(raw_labels: np.ndarray, attention: Optional[np.ndarray]) -> np.ndarray:
+    """Cluster with higher mean attention is splice.
+
+    If attention is None, falls back to the smaller cluster (legacy default).
+    """
+    raw = np.asarray(raw_labels).reshape(-1)
+    n0 = int((raw == 0).sum())
+    n1 = int((raw == 1).sum())
+    if attention is None:
+        chosen = 0 if n0 <= n1 else 1
+        return (raw == chosen).astype(bool)
+    att = np.asarray(attention).reshape(-1)
+    mean0 = float(att[raw == 0].mean()) if n0 else float("-inf")
+    mean1 = float(att[raw == 1].mean()) if n1 else float("-inf")
+    chosen = 0 if mean0 >= mean1 else 1
+    return (raw == chosen).astype(bool)
+

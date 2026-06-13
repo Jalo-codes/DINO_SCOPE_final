@@ -75,8 +75,7 @@ from lab_utils.eval.localization import (
 from lab_utils.eval.metrics import auroc
 from lab_utils.eval.zoom import attention_zoom_bbox
 from lab_utils.eval.gap_utils import compute_gap_prediction
-from lab_utils.eval.partition import spherical_kmeans2
-from contrastive_inpainting_v1.diagnose.polarity import polarity_attn
+from lab_utils.eval.partition import spherical_kmeans2, polarity_attn
 
 from contrastive_inpainting_v1.configs.base import Config
 from contrastive_inpainting_v1.experiments.tgif2_flux import (
@@ -1000,9 +999,16 @@ def _run_epoch_viz(model: nn.Module, items: list, epoch: int, out_dir: str, devi
     import torchvision.transforms.functional as TF
     from torchvision import transforms
     from lab_utils.viz import heatmap_rgb, overlay_blend, mask_tint, save_composite
-    from lab_utils.eval.partition import spherical_kmeans2
-    from contrastive_inpainting_v1.diagnose.polarity import polarity_attn
-    from contrastive_inpainting_v1.scripts.swin_outlier_decode import _outlier_score, _gap_thr, _otsu_thr
+    from lab_utils.eval.partition import spherical_kmeans2, polarity_attn
+    from lab_utils.eval.gap_utils import (
+        compute_outlier_score,
+        compute_gap_threshold,
+        compute_otsu_threshold,
+    )
+    def _outlier_score(z, att):
+        return compute_outlier_score(z, att, mode='median')
+    _gap_thr = compute_gap_threshold
+    _otsu_thr = compute_otsu_threshold
 
     model.eval()
     os.makedirs(out_dir, exist_ok=True)

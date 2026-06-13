@@ -50,7 +50,7 @@ from lab_utils.model.multi_head_detector import build_multi_head_detector
 from lab_utils.eval.localization import collect_zoom_eval_samples, report_zoom_eval
 from lab_utils.eval.robustness import run_robustness_sweep
 from lab_utils.eval.zoom import attention_zoom_bbox
-from lab_utils.eval.partition import spherical_kmeans2, decode_deploy_mask
+from lab_utils.eval.partition import spherical_kmeans2, decode_deploy_mask, polarity_attn
 from lab_utils.eval.decode_cli import add_decode_args, decode_spec_from_args, decode_label
 
 from contrastive_inpainting_v1.configs.base import Config
@@ -62,7 +62,7 @@ from contrastive_inpainting_v1.configs.augment import (
 from contrastive_inpainting_v1.experiments.imd2020_bce import IMD2020BCESpec
 from contrastive_inpainting_v1.experiments.tgif2_flux import (
     build_tgif2_items, split_tgif2_coco_ids)
-from contrastive_inpainting_v1.diagnose.polarity import polarity_attn
+
 
 # Reuse the trainer's eval machinery verbatim — same metrics, same log format,
 # so checkpoint reports are directly comparable with in-train eval lines.
