@@ -962,7 +962,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('--robust_every',     type=int, default=3)
     p.add_argument('--robust_conditions', type=str, nargs='+',
                    default=list(DEFAULT_EVAL_AUG_CONDITIONS))
-    p.add_argument('--eval_max_items',   type=int, default=0)
+    p.add_argument('--eval_max_items',   type=int, default=200)
     # Contrastive loss (symmetric is the v2 default; legacy kept for parity).
     # None ⇒ keep the cfg default.
     p.add_argument('--contrastive_loss_mode', type=str, default=None,
@@ -1416,7 +1416,24 @@ def main():
             log_line(f'[cfg] WARN: splice sources present but EXCLUDED from draws '
                      f'(no fraction given): {mix_stats["excluded_sources"]}')
     else:
-        weights = _splice_balance_weights(train_items)
+        from lab_utils.data.sampling import is_splice, source_splice_balance_weights
+        splice_sources = set()
+        for item in train_items:
+            if is_splice(item):
+                splice_sources.add(str(item.get('source', 'unknown')))
+        
+        if 'casia' in splice_sources and len(splice_sources) > 1:
+            source_fracs = {'casia': 0.3}
+            other_share = 0.7 / (len(splice_sources) - 1)
+            for src in splice_sources:
+                if src != 'casia':
+                    source_fracs[src] = other_share
+            weights, mix_stats = source_splice_balance_weights(
+                train_items, source_fracs, target_splice_frac=0.5)
+            log_line(f'[cfg] splice_mix (automatic 30% Casia drop): {source_fracs}')
+            log_line(f'[cfg] splice_mix realized: {mix_stats}')
+        else:
+            weights = _splice_balance_weights(train_items)
     # DDP: each rank draws its own shard of the per-epoch sample budget from the
     # full weighted distribution (per-rank generator seed → different draws).
     per_rank_samples = max(1, args.train_samples // max(1, ctx.world_size))
