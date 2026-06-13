@@ -38,6 +38,7 @@ from torchvision import transforms
 
 from lab_utils.data.sampling import deterministic_subsample
 from lab_utils.train.checkpoint import load as ckpt_load
+from lab_utils.train.amp import resolve_amp
 from lab_utils.model.multi_head_detector import build_multi_head_detector
 from lab_utils.eval.partition import DecodeSpec, decode_deploy_mask
 from lab_utils.viz import heatmap_rgb, overlay_blend, mask_tint, save_composite
@@ -141,6 +142,7 @@ def main():
     apply_path_defaults(args)
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device(args.device if (args.device != 'cuda' or torch.cuda.is_available()) else 'cpu')
+    use_amp, amp_dtype = resolve_amp(device, want_amp=True)
     cfg = Config()
     n = cfg.resolution.num_patches_per_side
     T = cfg.resolution.image_size
@@ -232,8 +234,8 @@ def main():
 
             inp = normalize(TF.to_tensor(
                 TF.resize(source, [T, T], Image.BILINEAR))).unsqueeze(0).to(device)
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16,
-                                enabled=(device.type == 'cuda')):
+            with torch.autocast(device_type='cuda', dtype=(amp_dtype or torch.float32),
+                                enabled=use_amp):
                 out = model(inp)
             z = out.get('contrastive')
             if z is None:

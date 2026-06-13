@@ -1024,6 +1024,13 @@ class _CFSample:
     refine_prec: float
     refine_rec: float
     refined: bool        # True iff pass 2 actually ran (region small enough)
+    zoom_mode: str = 'single'
+    f1_multi: Optional[float] = None
+    iou_multi: Optional[float] = None
+    prec_multi: Optional[float] = None
+    rec_multi: Optional[float] = None
+    n_crops: int = 1
+    multi_fired: bool = False
 
 
 @torch.no_grad()
@@ -1041,12 +1048,34 @@ def _embed_pil(
     t = torch.from_numpy(arr).permute(2, 0, 1)               # (3, S, S)
     m = torch.tensor(mean, dtype=torch.float32).view(3, 1, 1)
     s = torch.tensor(std, dtype=torch.float32).view(3, 1, 1)
-    t = ((t - m) / s).unsqueeze(0).to(device)
+    t = ((t - m) / s).unsqueeze(0).to(device, non_blocking=True)
     out = model(t)
     z = out['contrastive']
     if z is None:
         return None
     return z[0].detach().cpu().float().numpy()               # (N, d)
+
+
+@torch.no_grad()
+def _embed_logit_attn_pil(
+    model: nn.Module, pil: Image.Image, res: Resolution, device: torch.device,
+    mean: Tuple[float, float, float], std: Tuple[float, float, float],
+) -> Tuple[Optional[np.ndarray], Optional[float], Optional[np.ndarray]]:
+    """One forward of a PIL crop → (contrastive z (N, d) or None, image_logit or None, pool_attention or None)."""
+    img = resize_only(pil.convert('RGB'), res)
+    arr = np.asarray(img, dtype=np.float32) / 255.0          # (S, S, 3)
+    t = torch.from_numpy(arr).permute(2, 0, 1)               # (3, S, S)
+    m = torch.tensor(mean, dtype=torch.float32).view(3, 1, 1)
+    s = torch.tensor(std, dtype=torch.float32).view(3, 1, 1)
+    t = ((t - m) / s).unsqueeze(0).to(device, non_blocking=True)
+    out = model(t)
+    z = out['contrastive']
+    z_np = z[0].detach().cpu().float().numpy() if z is not None else None
+    logit = (float(out['image_logit'][0].detach().cpu().float())
+             if out.get('image_logit') is not None else None)
+    attention = out.get('pool_attention')
+    attn_np = attention[0].detach().cpu().float().numpy() if attention is not None else None
+    return z_np, logit, attn_np
 
 
 def _minority_bbox(
@@ -1129,6 +1158,8 @@ def collect_coarse_to_fine_samples(
     refine_max_frac: float = 0.40,
     corruption_spec: Optional[CorruptionSpec] = None,
     decode_spec: DecodeSpec = DecodeSpec(),
+    zoom_mode: str = 'single',
+    zoom_thresh_mode: str = 'otsu',
     log_tag: str = '[eval]',
     tag: str = '',
 ) -> List[_CFSample]:
@@ -1172,13 +1203,14 @@ def collect_coarse_to_fine_samples(
             src = apply_corruption(src, corruption_spec).image
 
         # PASS 1 — coarse full-image partition.
-        z1 = _embed_pil(model, src, res, device, normalize_mean, normalize_std)
+        z1, logit_full, attn_full = _embed_logit_attn_pil(model, src, res, device, normalize_mean, normalize_std)
         if z1 is None:
             continue
         raw1 = decode_oracle_labels(z1, decode_spec)
         cpx_a = _patches_to_pixels((raw1 == 1), P, res.patch_size)
         cpx_b = ~cpx_a
         c_f1, c_iou, c_prec, c_rec = _oracle_pixel(cpx_a, cpx_b, gt_px)
+        cpx_chosen = cpx_a if (c_f1 == _mask_metrics(cpx_a.reshape(-1), gt_px.reshape(-1))[0]) else cpx_b
 
         # PASS 2 — refine, only when the flagged region is compact enough.
         bbox, minority_frac = _minority_bbox(raw1, P, pad_frac)
@@ -1199,11 +1231,120 @@ def collect_coarse_to_fine_samples(
                 refined = True
                 n_refined += 1
 
+        # Multi-zoom path (Part A)
+        f1_multi, iou_multi, prec_multi, rec_multi = None, None, None, None
+        n_crops = 0
+        multi_fired = False
+        if zoom_mode == 'multi':
+            from lab_utils.eval.zoom import multi_zoom_bboxes
+            if decode_spec.method == 'graph':
+                from lab_utils.eval.partition import graph_components_decode
+                mask_graph, _ = graph_components_decode(
+                    z1,
+                    tau_pos=decode_spec.tau_pos,
+                    tau_neg=decode_spec.tau_neg,
+                    s_edge=decode_spec.s_edge,
+                    mutual_knn_k=decode_spec.mutual_knn_k,
+                    r_spatial=decode_spec.r_spatial,
+                    m_min=decode_spec.m_min,
+                    theta_w=decode_spec.theta_w,
+                    theta_x=decode_spec.theta_x,
+                    attention_polarity=decode_spec.attention_polarity,
+                )
+                H_mask = mask_graph.reshape(P, P) > 0
+            else:
+                H_mask = None
+
+            W_orig, H_orig = src.size
+            bboxes = multi_zoom_bboxes(
+                attn_full.reshape(P, P) if attn_full is not None else np.zeros((P, P)),
+                H_orig, W_orig,
+                max_regions=3, theta_fill=0.45, base_padding=2, pad_frac=pad_frac,
+                min_crop_patches=8, thresh_mode=zoom_thresh_mode, hot_mask=H_mask
+            )
+            
+            if len(bboxes) >= 2:
+                multi_fired = True
+            
+            accepted_crop_masks = []
+            p_full = 1.0 / (1.0 + math.exp(-logit_full)) if logit_full is not None else 0.0
+            n_crops = len(bboxes)
+            
+            for bbox_item in bboxes:
+                x0, y0, x1, y1 = bbox_item
+                crop_pil = src.crop((x0, y0, x1, y1))
+                
+                c0 = max(0, min(P - 1, int(round(x0 * P / W_orig))))
+                c1 = max(c0 + 1, min(P, int(round(x1 * P / W_orig))))
+                r0 = max(0, min(P - 1, int(round(y0 * P / H_orig))))
+                r1 = max(r0 + 1, min(P, int(round(y1 * P / H_orig))))
+                bbox_patch = (r0, r1, c0, c1)
+                
+                z_zoom, logit_zoom, attn_zoom = _embed_logit_attn_pil(
+                    model, crop_pil, res, device, normalize_mean, normalize_std
+                )
+                
+                if z_zoom is not None:
+                    p_zoom = 1.0 / (1.0 + math.exp(-logit_zoom)) if logit_zoom is not None else 1.0
+                    if p_zoom >= p_full:
+                        if decode_spec.method == 'graph':
+                            from lab_utils.eval.partition import graph_components_decode
+                            raw_crop, _ = graph_components_decode(
+                                z_zoom, grid_hw=(P, P),
+                                tau_pos=decode_spec.tau_pos,
+                                tau_neg=decode_spec.tau_neg,
+                                s_edge=decode_spec.s_edge,
+                                mutual_knn_k=decode_spec.mutual_knn_k,
+                                r_spatial=decode_spec.r_spatial,
+                                m_min=decode_spec.m_min,
+                                theta_w=decode_spec.theta_w,
+                                theta_x=decode_spec.theta_x,
+                                attention_polarity=decode_spec.attention_polarity,
+                            )
+                            placed_crop = _place_fine_in_pixel_frame(raw_crop > 0, bbox_patch, res)
+                        else:
+                            raw_crop = decode_oracle_labels(z_zoom, decode_spec)
+                            ps = res.patch_size
+                            gt_crop = gt_px[r0 * ps : r1 * ps, c0 * ps : c1 * ps]
+                            tw = (c1 - c0) * ps
+                            th = (r1 - r0) * ps
+                            crop_mask_a = (raw_crop.reshape(P, P) == 1)
+                            pil_a = Image.fromarray((crop_mask_a.astype(np.uint8) * 255), mode='L').resize((tw, th), Image.NEAREST)
+                            px_a = np.asarray(pil_a) > 127
+                            px_b = ~px_a
+                            
+                            def f1_score(pred, gt):
+                                tp = (pred & gt).sum()
+                                fp = (pred & ~gt).sum()
+                                fn = (~pred & gt).sum()
+                                denom = 2 * tp + fp + fn
+                                return (2 * tp) / denom if denom > 0 else 0.0
+                            
+                            best_px = px_a if f1_score(px_a, gt_crop) >= f1_score(px_b, gt_crop) else px_b
+                            placed_crop = np.zeros_like(gt_px, dtype=bool)
+                            placed_crop[r0 * ps : r1 * ps, c0 * ps : c1 * ps] = best_px
+                        
+                        accepted_crop_masks.append(placed_crop)
+
+            if len(accepted_crop_masks) == 0:
+                refine_px_multi = cpx_chosen
+            else:
+                refine_px_multi = np.zeros_like(gt_px, dtype=bool)
+                for m in accepted_crop_masks:
+                    refine_px_multi |= m
+                    
+            f1_multi, iou_multi, prec_multi, rec_multi = _oracle_pixel(
+                refine_px_multi, ~refine_px_multi, gt_px
+            )
+
         samples.append(_CFSample(
             kind=it.get('kind', ''), area=area, bucket=bucket,
             coarse_f1=c_f1, coarse_iou=c_iou, coarse_prec=c_prec, coarse_rec=c_rec,
             refine_f1=r_f1, refine_iou=r_iou, refine_prec=r_prec, refine_rec=r_rec,
             refined=refined,
+            zoom_mode=zoom_mode,
+            f1_multi=f1_multi, iou_multi=iou_multi, prec_multi=prec_multi, rec_multi=rec_multi,
+            n_crops=n_crops, multi_fired=multi_fired,
         ))
         n_seen += 1
 
@@ -1237,10 +1378,35 @@ def report_coarse_to_fine(
         cf1, rf1 = cf1_st['median'], rf1_st['median']
         cpr, rpr = cpr_st['median'], rpr_st['median']
         n_ref = sum(1 for s in bs if s.refined)
+        
+        has_multi = any(s.f1_multi is not None for s in bs)
+        if has_multi:
+            rf1_multi_st = _stats([s.f1_multi for s in bs if s.f1_multi is not None])
+            ri_multi_st  = _stats([s.iou_multi for s in bs if s.iou_multi is not None])
+            rpr_multi_st = _stats([s.prec_multi for s in bs if s.prec_multi is not None])
+            rrc_multi_st = _stats([s.rec_multi for s in bs if s.rec_multi is not None])
+            rf1_multi = rf1_multi_st['median']
+            ri_multi = ri_multi_st['median']
+            rpr_multi = rpr_multi_st['median']
+            rrc_multi = rrc_multi_st['median']
+            n_fired = sum(1 for s in bs if s.multi_fired)
+            mean_crops = float(np.mean([s.n_crops for s in bs]))
+            fired_rate = float(n_fired) / len(bs) if len(bs) > 0 else 0.0
+            
         out[b] = {'n': len(bs), 'n_refined': n_ref,
                   'coarse_f1': cf1, 'refine_f1': rf1,
                   'coarse_f1_mean': cf1_st['mean'], 'refine_f1_mean': rf1_st['mean'],
                   'coarse_prec': cpr, 'refine_prec': rpr}
+                  
+        if has_multi:
+            out[b].update({
+                'refine_multi_f1': rf1_multi,
+                'refine_multi_f1_mean': rf1_multi_st['mean'],
+                'refine_multi_prec': rpr_multi,
+                'multi_fired_count': n_fired,
+                'mean_crops': mean_crops,
+            })
+            
         log_line(
             f'{log_tag}{suffix} c2f bucket={b} n={len(bs)} refined={n_ref} | '
             f'coarse f1={cf1:.4f}(m={cf1_st["mean"]:.4f}) '
@@ -1256,6 +1422,19 @@ def report_coarse_to_fine(
         )
         log_line(f'{log_tag}{suffix} c2f bucket={b} coarse f1 {_pct_line(cf1_st)}')
         log_line(f'{log_tag}{suffix} c2f bucket={b} refine f1 {_pct_line(rf1_st)}')
+        
+        if has_multi:
+            log_line(
+                f'{log_tag}{suffix} c2f_multi bucket={b} n={len(bs)} fired={n_fired}({fired_rate:.2f}) crops={mean_crops:.2f} | '
+                f'multi  f1={rf1_multi:.4f}(m={rf1_multi_st["mean"]:.4f}) '
+                f'iou={ri_multi:.4f}(m={ri_multi_st["mean"]:.4f}) '
+                f'prec={rpr_multi:.4f}(m={rpr_multi_st["mean"]:.4f}) '
+                f'rec={rrc_multi:.4f}(m={rrc_multi_st["mean"]:.4f}) | '
+                f'Δf1={rf1_multi - cf1:+.4f} Δprec={rpr_multi - cpr:+.4f} '
+                f'Δrec={rrc_multi - crc_st["median"]:+.4f}'
+            )
+            log_line(f'{log_tag}{suffix} c2f bucket={b} refine_multi f1 {_pct_line(rf1_multi_st)}')
+            
     return out
 
 
@@ -1495,7 +1674,7 @@ def _embed_logit_pil(
     t = torch.from_numpy(arr).permute(2, 0, 1)
     m = torch.tensor(mean, dtype=torch.float32).view(3, 1, 1)
     s = torch.tensor(std, dtype=torch.float32).view(3, 1, 1)
-    t = ((t - m) / s).unsqueeze(0).to(device)
+    t = ((t - m) / s).unsqueeze(0).to(device, non_blocking=True)
     out = model(t)
     z = out['contrastive']
     z_np = z[0].detach().cpu().float().numpy() if z is not None else None

@@ -1,0 +1,37 @@
+{
+  "_comment": "Sweep queue for contrastive_inpainting_v1.scripts.orchestrate. 'base_args' are merged into every entry's 'args' (entry wins). JSON booleans: true -> bare flag (e.g. --casia_train), false -> flag omitted; lists -> repeated values after the flag; everything else -> --key value. The literal string {run_root} in any value is replaced with the absolute --run_root passed to the orchestrator. Entries that do not set 'checkpoint_root' get --checkpoint_root <run_root>/<name> injected automatically, so each run's checkpoints/logs land under their own subdir. Run: python -m contrastive_inpainting_v1.scripts.orchestrate --queue sweeps/example_queue.json --run_root /content/drive/MyDrive/runs/tau_sweep",
+  "base_args": {
+    "imd2020_root": "/content/IMD2020",
+    "casia_root": "/content/casia",
+    "anyedit_root": "/content/AnyEdit",
+    "casia_train": true,
+    "imd_val_only": true,
+    "eval_decode": "graph",
+    "num_epochs": 4
+  },
+  "runs": [
+    {
+      "name": "tau60_neg15",
+      "module": "contrastive_inpainting_v1.scripts.train_multi_head",
+      "args": {
+        "tau_pos": 0.6,
+        "tau_neg": 0.15
+      }
+    },
+    {
+      "name": "tau70_neg10",
+      "module": "contrastive_inpainting_v1.scripts.train_multi_head",
+      "args": {
+        "tau_pos": 0.7,
+        "tau_neg": 0.1
+      }
+    },
+    {
+      "name": "eval_tau60_neg15",
+      "module": "contrastive_inpainting_v1.scripts.eval_checkpoint",
+      "args": {
+        "ckpt": "{run_root}/tau60_neg15/epoch_003.pt"
+      }
+    }
+  ]
+}

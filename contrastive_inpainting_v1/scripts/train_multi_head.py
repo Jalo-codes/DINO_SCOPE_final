@@ -41,6 +41,7 @@ from lab_utils.logging.text import install_log, log_line
 from lab_utils.data.dataset import LabDataset, lab_collate_fn
 from lab_utils.data.loaders import LoaderConfig, build_eval_loader
 from lab_utils.train.checkpoint import load as ckpt_load, save as ckpt_save
+from lab_utils.train.amp import resolve_amp
 from lab_utils.train.distributed import (
     DistributedContext,
     barrier,
@@ -146,6 +147,7 @@ def _run_image_bce_eval(
     model.eval()
     logits_all, labels_all, areas_all = [], [], []
 
+    use_amp_eval, amp_dtype_eval = resolve_amp(device, want_amp=True)
     with torch.no_grad():
         for batch in loader:
             if batch is None:
@@ -155,8 +157,8 @@ def _run_image_bce_eval(
                 {k: v[i] for k, v in batch['meta'].items()}
                 for i in range(img.shape[0])
             ]
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16,
-                                enabled=(device.type == 'cuda')):
+            with torch.autocast(device_type='cuda', dtype=(amp_dtype_eval or torch.float32),
+                                enabled=use_amp_eval):
                 logit = model(img)
             logit = logit.detach().cpu().float().numpy()
             for i in range(len(logit)):
@@ -292,12 +294,13 @@ def _run_localization_eval(
 
     acc = {b: {'f1': [], 'iou': []} for b in buckets}
 
+    use_amp_eval, amp_dtype_eval = resolve_amp(device, want_amp=True)
     for batch in loader:
         if batch is None:
             continue
         img = batch['img'].to(device, non_blocking=True)
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16,
-                            enabled=(device.type == 'cuda')):
+        with torch.autocast(device_type='cuda', dtype=(amp_dtype_eval or torch.float32),
+                            enabled=use_amp_eval):
             out = multi_head(img)
         z_b = out.get('contrastive')
         if z_b is None:
@@ -391,12 +394,13 @@ def _run_patch_bce_loc_eval(
     buckets = ('small', 'medium', 'large')
     acc = {b: {'iou': [], 'f1': [], 'prec': [], 'rec': [], 'iou_ceil': []} for b in buckets}
     thr_grid = np.linspace(-4.0, 4.0, 17)
+    use_amp_eval, amp_dtype_eval = resolve_amp(device, want_amp=True)
     for batch in loader:
         if batch is None:
             continue
         img = batch['img'].to(device, non_blocking=True)
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16,
-                            enabled=(device.type == 'cuda')):
+        with torch.autocast(device_type='cuda', dtype=(amp_dtype_eval or torch.float32),
+                            enabled=use_amp_eval):
             out = eval_model(img)
         pl = out.get('patch_logit')
         if pl is None:
@@ -480,6 +484,8 @@ def _seed_worker(worker_id: int) -> None:
 
 def _subsample_items(items, n, *, seed='swin') -> list:
     """Deterministic md5 subsample. Stable across runs."""
+    if n <= 0:
+        return list(items)
     if not items or len(items) <= n:
         return list(items)
     def _key(it):
@@ -654,6 +660,8 @@ def _attention_zoom_second_pass(
 
 def _make_bce_eval_callable(model_callable, items, cfg, device,
                             *, batch_size, num_workers,
+                            persistent_workers: bool = False,
+                            prefetch_factor: Optional[int] = None,
                             gt_patch_threshold: float = 0.06):
     """Build closure: aug_kwargs → metrics dict, for the robustness sweep."""
     def _eval_under_aug(aug_kwargs, *, tag):
@@ -673,6 +681,8 @@ def _make_bce_eval_callable(model_callable, items, cfg, device,
                 batch_size=batch_size,
                 num_workers=num_workers,
                 pin_memory=(device.type == 'cuda'),
+                persistent_workers=persistent_workers,
+                prefetch_factor=prefetch_factor,
             ),
         )
         logits, labels = _collect_image_logits(model_callable, loader, device)
@@ -736,6 +746,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('--num_workers',      type=int, default=0,
                    help='0 avoids the OMP_NUM_THREADS + fork SIGABRT seen on the '
                         'training box. Crop telemetry is also only reliable at 0.')
+    p.add_argument('--persistent_workers', action='store_true', default=False)
+    p.add_argument('--prefetch_factor', type=int, default=None)
     p.add_argument('--device',           type=str, default='cuda')
     p.add_argument('--seed',             type=int, default=42)
     p.add_argument('--log_every',        type=int, default=20)
@@ -950,7 +962,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('--robust_every',     type=int, default=3)
     p.add_argument('--robust_conditions', type=str, nargs='+',
                    default=list(DEFAULT_EVAL_AUG_CONDITIONS))
-    p.add_argument('--eval_max_items',   type=int, default=200)
+    p.add_argument('--eval_max_items',   type=int, default=0)
     # Contrastive loss (symmetric is the v2 default; legacy kept for parity).
     # None ⇒ keep the cfg default.
     p.add_argument('--contrastive_loss_mode', type=str, default=None,
@@ -988,6 +1000,7 @@ def _eval_decode_spec(args, cfg):
     return DecodeSpec(
         method=getattr(args, 'eval_decode', 'kmeans'),
         tau_pos=float(cfg.TAU_POS), tau_neg=float(cfg.TAU_NEG),
+        n_init=2,
         s_edge=getattr(args, 'eval_graph_s_edge', None),
         mutual_knn_k=int(getattr(args, 'eval_graph_knn', 10)),
         r_spatial=getattr(args, 'eval_graph_spatial', None),
@@ -1010,6 +1023,7 @@ def _run_epoch_viz(model: nn.Module, items: list, epoch: int, out_dir: str, devi
     _gap_thr = compute_gap_threshold
     _otsu_thr = compute_otsu_threshold
 
+    use_amp_eval, amp_dtype_eval = resolve_amp(device, want_amp=True)
     model.eval()
     os.makedirs(out_dir, exist_ok=True)
     n = cfg.resolution.num_patches_per_side
@@ -1042,8 +1056,8 @@ def _run_epoch_viz(model: nn.Module, items: list, epoch: int, out_dir: str, devi
                 pass
 
         inp = normalize(TF.to_tensor(TF.resize(source, [T, T], Image.BILINEAR))).unsqueeze(0).to(device, non_blocking=True)
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16,
-                            enabled=(device.type == 'cuda')):
+        with torch.autocast(device_type='cuda', dtype=(amp_dtype_eval or torch.float32),
+                            enabled=use_amp_eval):
             out = model(inp)
 
         panels = [('Original', src_np)]
@@ -1121,9 +1135,12 @@ def main():
             role='train',
         )
         install_log(str(_run_dir.log_path))
+        from lab_utils.logging.csv_logger import CsvLogger as _CsvLogger
+        _csv_logger = _CsvLogger(_run_dir.metrics_path)
     else:
         global log_line
         log_line = lambda *_a, **_k: None  # noqa: E731  rank>0 stays quiet
+        _csv_logger = None
 
     device = torch.device(
         f'cuda:{ctx.local_rank}'
@@ -1132,6 +1149,23 @@ def main():
     )
     log_line(f'[dist] rank={ctx.rank}/{ctx.world_size} local_rank={ctx.local_rank} '
              f'is_main={ctx.is_main} device={device}')
+
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision('high')
+
+    use_amp, amp_dtype = resolve_amp(device, want_amp=args.bf16)
+    if use_amp:
+        cc_str = "N/A"
+        if device.type == 'cuda':
+            try:
+                cc_major, cc_minor = torch.cuda.get_device_capability(device)
+                cc_str = f"{cc_major}.{cc_minor}"
+            except Exception:
+                pass
+        amp_mode = "bf16" if amp_dtype == torch.bfloat16 else "fp16"
+        log_line(f"[cfg] amp={amp_mode} cc={cc_str} device={device}")
+    else:
+        log_line(f"[cfg] amp=off cc=N/A device={device}")
 
     # Sanity: at least one head must be active (per multi_head_detector ctor).
     if args.contrastive_dim <= 0 and args.pool_hidden <= 0:
@@ -1436,6 +1470,8 @@ def main():
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             pin_memory=(device.type == 'cuda'),
+            persistent_workers=args.persistent_workers,
+            prefetch_factor=args.prefetch_factor,
         ))
 
     imd_val_loader   = _sub_loader(imd_eval_items)
@@ -1534,11 +1570,10 @@ def main():
     log_line('[cfg] pos_weight=1.0 (sampler-balanced, no class reweight)')
 
     # ── mixed precision ──────────────────────────────────────────────────────
-    use_amp = args.bf16 and device.type == 'cuda'
-    amp_dtype = torch.bfloat16 if use_amp else None
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16))
     if use_amp:
-        log_line('[cfg] bf16 mixed-precision ENABLED via torch.cuda.amp')
+        amp_mode = "bf16" if amp_dtype == torch.bfloat16 else "fp16"
+        log_line(f'[cfg] {amp_mode} mixed-precision ENABLED via torch.cuda.amp')
 
     # ── training loop ────────────────────────────────────────────────────────
     global_step = 0
@@ -1903,6 +1938,26 @@ def main():
             f'(bce={bce_str} contr={cont_str} patch={patch_str}) bce_acc={bce_acc_str} '
             f'bce_ignored={bce_ignored} contr_ignored={contr_ignored}'
         )
+        if ctx.is_main and _csv_logger is not None:
+            _csv_row: dict = dict(
+                epoch=epoch,
+                step=global_step,
+                loss=round(loss_acc_total / max(n_steps_observed, 1), 6),
+                lr=scheduler.get_last_lr()[0],
+            )
+            if bce_active:
+                _csv_row['loss_bce']  = round(loss_acc_bce  / max(n_steps_observed, 1), 6)
+                _csv_row['bce_acc']   = round(bce_correct / max(bce_total, 1), 6)
+            if cont_active:
+                _csv_row['loss_cont'] = round(loss_acc_cont / max(n_steps_observed, 1), 6)
+                if sim_diag_steps > 0:
+                    _csv_row['simpos']   = round(sim_pos_acc  / sim_diag_steps, 6)
+                    _csv_row['simneg']   = round(sim_neg_acc  / sim_diag_steps, 6)
+                    _csv_row['realsim']  = round(real_sim_acc / sim_diag_steps, 6)
+                    _csv_row['repel_af'] = round(repel_af_acc / sim_diag_steps, 6)
+            if patch_active:
+                _csv_row['loss_patch'] = round(loss_acc_patch / max(n_steps_observed, 1), 6)
+            _csv_logger.write(**_csv_row)
         if zoom_pass_active:
             log_line(
                 f'[zoom] epoch={epoch} steps_fired={zoom_steps_fired}/{n_steps_observed} '
@@ -1965,6 +2020,8 @@ def main():
                         c_loader = build_eval_loader(c_ds, LoaderConfig(
                             batch_size=args.batch_size, num_workers=args.num_workers,
                             pin_memory=(device.type == 'cuda'),
+                            persistent_workers=args.persistent_workers,
+                            prefetch_factor=args.prefetch_factor,
                         ))
                         # Only provide fakes for zoom eval
                         eval_sources.append((c_loader, c_fakes, f'tgif_val/{t_}/{mf}'))
@@ -1973,29 +2030,36 @@ def main():
 
             # 1. Detection (BCE head)
             if bce_adapter is not None:
+                t0 = time.time()
                 for loader, _, tag in eval_sources:
                     if loader is None: continue
                     metrics = _run_image_bce_eval(bce_adapter, loader, device, log_tag='[eval]', tag=tag)
                     if tag == 'imd_val':
                         imd_opt_thresh = metrics.get('opt_thresh')
+                log_line(f'[eval] detection step elapsed={time.time() - t0:.2f}s')
 
             # 2. Localization (Contrastive head — decode per --eval_decode)
             if args.contrastive_dim > 0:
+                t0 = time.time()
                 _eval_dspec = _eval_decode_spec(args, cfg)
                 for loader, _, tag in eval_sources:
                     if loader is None: continue
                     _run_localization_eval(eval_model, loader, device, cfg=cfg,
                                            decode_spec=_eval_dspec,
                                            log_tag='[eval]', tag=tag)
+                log_line(f'[eval] localization step elapsed={time.time() - t0:.2f}s')
 
             # 3. Dense Localization (Patch BCE head)
             if patch_active:
+                t0 = time.time()
                 for loader, _, tag in eval_sources:
                     if loader is None: continue
                     _run_patch_bce_loc_eval(eval_model, loader, device, res=cfg.resolution, log_tag='[eval]', tag=tag)
+                log_line(f'[eval] patch BCE step elapsed={time.time() - t0:.2f}s')
 
             # 4. Zoom Eval (Contrastive head) - Condensed report, skip oracle, skip confidence gating
             if args.val_zoom and args.contrastive_dim > 0:
+                t0 = time.time()
                 for _, zoom_items, tag in eval_sources:
                     if not zoom_items: continue
                     zsamples = collect_zoom_eval_samples(
@@ -2008,6 +2072,7 @@ def main():
                     report_zoom_eval(
                         zsamples, condensed=True, log_tag='[eval]', tag=tag,
                     )
+                log_line(f'[eval] zoom step elapsed={time.time() - t0:.2f}s')
 
             # ── robustness sweep (BCE head) ──────────────────────────────────
             do_robust = (args.pool_hidden > 0 and args.robust_every > 0
@@ -2053,6 +2118,8 @@ def main():
                     eval_fn = _make_bce_eval_callable(
                         bce_adapter, cap_items, cfg, device,
                         batch_size=args.batch_size, num_workers=args.num_workers,
+                        persistent_workers=args.persistent_workers,
+                        prefetch_factor=args.prefetch_factor,
                         gt_patch_threshold=float(args.gt_patch_threshold),
                     )
                     run_robustness_sweep(

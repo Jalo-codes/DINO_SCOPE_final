@@ -25,6 +25,7 @@ import torchvision.transforms.functional as TF
 
 from lab_utils.data.sampling import deterministic_subsample
 from lab_utils.train.checkpoint import load as ckpt_load
+from lab_utils.train.amp import resolve_amp
 from lab_utils.model.multi_head_detector import build_multi_head_detector
 from lab_utils.eval.partition import DecodeSpec, decode_deploy_mask, spherical_kmeans2, polarity_attn
 from lab_utils.eval.sliding_window import _square_crop_boxes
@@ -139,6 +140,7 @@ def main():
     apply_path_defaults(args)
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device(args.device if (args.device != 'cuda' or torch.cuda.is_available()) else 'cpu')
+    use_amp, amp_dtype = resolve_amp(device, want_amp=True)
     cfg = Config()
     n = cfg.resolution.num_patches_per_side
     T = cfg.resolution.image_size
@@ -218,8 +220,8 @@ def main():
 
             # Full Image Forward
             with torch.no_grad():
-                with torch.autocast(device_type='cuda', dtype=torch.bfloat16,
-                                    enabled=(device.type == 'cuda')):
+                with torch.autocast(device_type='cuda', dtype=(amp_dtype or torch.float32),
+                                    enabled=use_amp):
                     out = model(inp)
                     
             z_full = out.get('contrastive')[0].detach().cpu().float().numpy()
@@ -257,8 +259,8 @@ def main():
                     # Forward pass
                     crop_t = normalize(TF.to_tensor(crop_resized)).unsqueeze(0).to(device)
                     with torch.no_grad():
-                        with torch.autocast(device_type='cuda', dtype=torch.bfloat16,
-                                            enabled=(device.type == 'cuda')):
+                        with torch.autocast(device_type='cuda', dtype=(amp_dtype or torch.float32),
+                                            enabled=use_amp):
                             out_win = model(crop_t)
                             
                     z_win = out_win.get('contrastive')[0].detach().cpu().float().numpy()

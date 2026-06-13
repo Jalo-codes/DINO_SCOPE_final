@@ -46,6 +46,7 @@ from lab_utils.logging.text import install_log, log_line
 from lab_utils.data.dataset import LabDataset
 from lab_utils.data.loaders import LoaderConfig, build_eval_loader
 from lab_utils.train.checkpoint import load as ckpt_load
+from lab_utils.train.amp import resolve_amp
 from lab_utils.model.multi_head_detector import build_multi_head_detector
 from lab_utils.eval.localization import collect_zoom_eval_samples, report_zoom_eval
 from lab_utils.eval.robustness import run_robustness_sweep
@@ -82,16 +83,17 @@ from contrastive_inpainting_v1.scripts.train_multi_head import (
 # ── A100-friendly wrapper: bf16 autocast forward, fp32 outputs ───────────────
 
 class _AutocastModel(nn.Module):
-    """Run the wrapped model under bf16 autocast and upcast every floating
+    """Run the wrapped model under resolved autocast and upcast every floating
     output back to fp32, so downstream numpy conversions never see bfloat16."""
 
-    def __init__(self, model: nn.Module, enabled: bool):
+    def __init__(self, model: nn.Module, enabled: bool, dtype: Optional[torch.dtype] = None):
         super().__init__()
         self.model = model
         self.enabled = bool(enabled)
+        self.dtype = dtype if dtype is not None else torch.bfloat16
 
     def forward(self, x):
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16,
+        with torch.autocast(device_type='cuda', dtype=self.dtype,
                             enabled=self.enabled):
             out = self.model(x)
         if isinstance(out, dict):
@@ -394,6 +396,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # Runtime — eval-only, so the batch can run far hotter than training.
     p.add_argument('--batch_size',  type=int, default=32)
     p.add_argument('--num_workers', type=int, default=4)
+    p.add_argument('--persistent_workers', action='store_true', default=False)
+    p.add_argument('--prefetch_factor', type=int, default=None)
     p.add_argument('--device',      type=str, default='cuda')
     p.add_argument('--no_bf16', action='store_true', default=False)
     add_decode_args(p)
@@ -414,8 +418,19 @@ def main():
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    use_bf16 = (not args.no_bf16) and device.type == 'cuda'
-    log_line(f'[cfg] ckpt={args.ckpt} out={out_dir} device={device} bf16={use_bf16} decode={decode_label(decode_spec)}')
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision('high')
+
+    use_amp, amp_dtype = resolve_amp(device, want_amp=(not args.no_bf16))
+    cc_str = "N/A"
+    if device.type == 'cuda':
+        try:
+            cc_major, cc_minor = torch.cuda.get_device_capability(device)
+            cc_str = f"{cc_major}.{cc_minor}"
+        except Exception:
+            pass
+    amp_mode = "bf16" if amp_dtype == torch.bfloat16 else ("fp16" if amp_dtype == torch.float16 else "off")
+    log_line(f'[cfg] amp={amp_mode} cc={cc_str} device={device} ckpt={args.ckpt} out={out_dir} decode={decode_label(decode_spec)}')
 
     cfg = Config()
 
@@ -439,7 +454,7 @@ def main():
     model.load_state_dict(sd)
     model.backbone.gradient_checkpointing_disable()
     model.eval()
-    eval_model = _AutocastModel(model, enabled=use_bf16)
+    eval_model = _AutocastModel(model, enabled=use_amp, dtype=amp_dtype)
 
     def _sub_loader(items):
         if not items:
@@ -456,6 +471,8 @@ def main():
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             pin_memory=(device.type == 'cuda'),
+            persistent_workers=args.persistent_workers,
+            prefetch_factor=args.prefetch_factor,
         ))
 
     # ── source 1: IMD ──
@@ -564,6 +581,8 @@ def main():
             eval_fn = _make_bce_eval_callable(
                 bce_adapter, items, cfg, device,
                 batch_size=args.batch_size, num_workers=args.num_workers,
+                persistent_workers=args.persistent_workers,
+                prefetch_factor=args.prefetch_factor,
                 gt_patch_threshold=float(args.gt_patch_threshold),
             )
             run_robustness_sweep(

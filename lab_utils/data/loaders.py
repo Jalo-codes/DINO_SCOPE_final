@@ -28,6 +28,8 @@ class LoaderConfig:
     distributed: bool = False
     rank: int = 0
     world_size: int = 1
+    persistent_workers: bool = False
+    prefetch_factor: Optional[int] = None
 
 
 class DistributedRandomSubsetSampler(Sampler):
@@ -182,6 +184,11 @@ def build_train_loader(dataset, cfg: LoaderConfig) -> DataLoader:
         sampler = RandomSampler(dataset, num_samples=int(cfg.train_samples_per_epoch))
     else:
         sampler = RandomSampler(dataset)
+    kwargs = {}
+    if cfg.num_workers > 0:
+        kwargs['persistent_workers'] = cfg.persistent_workers
+        if cfg.prefetch_factor is not None:
+            kwargs['prefetch_factor'] = cfg.prefetch_factor
     return DataLoader(
         dataset,
         batch_size=int(cfg.batch_size),
@@ -190,6 +197,7 @@ def build_train_loader(dataset, cfg: LoaderConfig) -> DataLoader:
         pin_memory=bool(cfg.pin_memory),
         collate_fn=lab_collate_fn,
         drop_last=bool(cfg.drop_last),
+        **kwargs,
     )
 
 
@@ -206,6 +214,11 @@ def build_eval_loader(dataset, cfg: LoaderConfig) -> DataLoader:
         if cfg.distributed and int(cfg.world_size) > 1
         else SequentialSampler(dataset)
     )
+    kwargs = {}
+    if cfg.num_workers > 0:
+        kwargs['persistent_workers'] = cfg.persistent_workers
+        if cfg.prefetch_factor is not None:
+            kwargs['prefetch_factor'] = cfg.prefetch_factor
     return DataLoader(
         dataset,
         batch_size=int(cfg.batch_size),
@@ -214,6 +227,7 @@ def build_eval_loader(dataset, cfg: LoaderConfig) -> DataLoader:
         pin_memory=bool(cfg.pin_memory),
         collate_fn=lab_collate_fn,
         drop_last=bool(cfg.drop_last),
+        **kwargs,
     )
 
 __all__ = [

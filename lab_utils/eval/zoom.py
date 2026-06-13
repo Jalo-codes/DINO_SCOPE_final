@@ -12,12 +12,12 @@ place_crop_in_full_frame which require PIL for the NN resize.
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
-from PIL import Image
 
 from .gap_utils import compute_gap_threshold, compute_otsu_threshold
+from .partition import _union_find_components
 
 
 def compute_hysteresis_mask(
@@ -64,6 +64,60 @@ def compute_hysteresis_mask(
         if (nxt == grown).all():
             return grown
         grown = nxt
+
+
+def get_padded_bbox(
+    r0_tight: int,
+    r1_tight: int,
+    c0_tight: int,
+    c1_tight: int,
+    n: int,
+    H: int,
+    W: int,
+    *,
+    base_padding: int = 2,
+    pad_frac: float = 0.15,
+    min_crop_patches: int = 8,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Factored-out padding, clamp, and expansion block of attention_zoom_bbox.
+    Maps patch bounding box to pixel bounding box."""
+    detected_h = r1_tight - r0_tight + 1
+    detected_w = c1_tight - c0_tight + 1
+    detected_side = max(detected_h, detected_w)
+
+    pad = max(base_padding, math.ceil(n * pad_frac / max(detected_side, 1)))
+
+    r0 = max(0, r0_tight - pad)
+    r1 = min(n - 1, r1_tight + pad)
+    c0 = max(0, c0_tight - pad)
+    c1 = min(n - 1, c1_tight + pad)
+
+    r_cent = 0.5 * (r0_tight + r1_tight)
+    c_cent = 0.5 * (c0_tight + c1_tight)
+
+    if (r1 - r0 + 1) < min_crop_patches:
+        half = min_crop_patches // 2
+        r0 = max(0, int(round(r_cent)) - half)
+        r1 = min(n - 1, r0 + min_crop_patches - 1)
+        if r1 == n - 1:
+            r0 = max(0, r1 - min_crop_patches + 1)
+
+    if (c1 - c0 + 1) < min_crop_patches:
+        half = min_crop_patches // 2
+        c0 = max(0, int(round(c_cent)) - half)
+        c1 = min(n - 1, c0 + min_crop_patches - 1)
+        if c1 == n - 1:
+            c0 = max(0, c1 - min_crop_patches + 1)
+
+    x_min = max(0, int(c0 * W / n))
+    x_max = min(W, int((c1 + 1) * W / n))
+    y_min = max(0, int(r0 * H / n))
+    y_max = min(H, int((r1 + 1) * H / n))
+
+    if (x_max - x_min) < 2 or (y_max - y_min) < 2:
+        return None
+
+    return (x_min, y_min, x_max, y_max)
 
 
 def attention_zoom_bbox(
@@ -119,51 +173,211 @@ def attention_zoom_bbox(
     if len(rows) == 0:
         return None
 
-    # ── Tight bbox (includes ALL hot patches) ────────────────────────────────
     r0_tight, r1_tight = int(rows.min()), int(rows.max())
     c0_tight, c1_tight = int(cols.min()), int(cols.max())
 
-    detected_h = r1_tight - r0_tight + 1
-    detected_w = c1_tight - c0_tight + 1
-    detected_side = max(detected_h, detected_w)
+    return get_padded_bbox(
+        r0_tight, r1_tight, c0_tight, c1_tight, n, H, W,
+        base_padding=base_padding, pad_frac=pad_frac,
+        min_crop_patches=min_crop_patches
+    )
 
-    # ── Area-aware padding ───────────────────────────────────────────────────
-    pad = max(base_padding, math.ceil(n * pad_frac / max(detected_side, 1)))
 
-    r0 = max(0, r0_tight - pad)
-    r1 = min(n - 1, r1_tight + pad)
-    c0 = max(0, c0_tight - pad)
-    c1 = min(n - 1, c1_tight + pad)
+def multi_zoom_bboxes(
+    att_nn: np.ndarray,
+    H_px: int,
+    W_px: int,
+    *,
+    max_regions: int = 3,
+    theta_fill: float = 0.45,
+    base_padding: int = 2,
+    pad_frac: float = 0.15,
+    min_crop_patches: int = 8,
+    thresh_mode: str = 'gap',
+    hot_mask: Optional[np.ndarray] = None,
+) -> List[Tuple[int, int, int, int]]:
+    """Determine multiple zoom bboxes for scenes with multiple disjoint hot regions."""
+    from .partition import _union_find_components
+    
+    att_nn = np.asarray(att_nn, dtype=np.float64)
+    n = att_nn.shape[0]
+    
+    if hot_mask is not None:
+        H = np.asarray(hot_mask, dtype=bool)
+    else:
+        att_flat = att_nn.reshape(-1)
+        if thresh_mode == 'hyst':
+            H = compute_hysteresis_mask(att_nn)
+        elif thresh_mode == 'otsu':
+            H = att_nn >= compute_otsu_threshold(att_flat)
+        else:
+            H = att_nn >= compute_gap_threshold(att_flat)
 
-    # ── Enforce minimum crop size ─────────────────────────────────────────────
-    # Expand symmetrically from the center of the original detection.
-    r_cent = 0.5 * (r0_tight + r1_tight)
-    c_cent = 0.5 * (c0_tight + c1_tight)
+    rows_hot, cols_hot = np.where(H)
+    if len(rows_hot) == 0:
+        return []
 
-    if (r1 - r0 + 1) < min_crop_patches:
-        half = min_crop_patches // 2
-        r0 = max(0, int(round(r_cent)) - half)
-        r1 = min(n - 1, r0 + min_crop_patches - 1)
-        if r1 == n - 1:
-            r0 = max(0, r1 - min_crop_patches + 1)
+    # 1. Connected components (8-connected)
+    N = n * n
+    adj = np.zeros((N, N), dtype=bool)
+    hot_indices = rows_hot * n + cols_hot
+    for dr in [-1, 0, 1]:
+        for dc in [-1, 0, 1]:
+            if dr == 0 and dc == 0:
+                continue
+            nr = rows_hot + dr
+            nc = cols_hot + dc
+            valid = (nr >= 0) & (nr < n) & (nc >= 0) & (nc < n)
+            for idx, r_n, c_n in zip(hot_indices[valid], nr[valid], nc[valid]):
+                if H[r_n, c_n]:
+                    adj[idx, r_n * n + c_n] = True
 
-    if (c1 - c0 + 1) < min_crop_patches:
-        half = min_crop_patches // 2
-        c0 = max(0, int(round(c_cent)) - half)
-        c1 = min(n - 1, c0 + min_crop_patches - 1)
-        if c1 == n - 1:
-            c0 = max(0, c1 - min_crop_patches + 1)
+    labels = _union_find_components(adj)
+    
+    # Identify unique components that belong to hot patches
+    unique_labels = np.unique(labels[hot_indices])
+    blobs = []
+    for lbl in unique_labels:
+        comp_idx = np.where((labels == lbl) & H.ravel())[0]
+        # Drop blobs < m_min (4 patches)
+        if len(comp_idx) >= 4:
+            blobs.append(comp_idx)
 
-    # ── Map patch coordinates to source pixels ────────────────────────────────
-    x_min = max(0, int(c0 * W / n))
-    x_max = min(W, int((c1 + 1) * W / n))
-    y_min = max(0, int(r0 * H / n))
-    y_max = min(H, int((r1 + 1) * H / n))
+    # 2. Valley split
+    final_blobs = []
+    for comp_idx in blobs:
+        rs = comp_idx // n
+        cs = comp_idx % n
+        r0_t, r1_t = int(rs.min()), int(rs.max())
+        c0_t, c1_t = int(cs.min()), int(cs.max())
+        h = r1_t - r0_t + 1
+        w = c1_t - c0_t + 1
+        side = max(h, w)
+        
+        did_split = False
+        if side > 0.5 * n:
+            area = h * w
+            fill_frac = len(comp_idx) / float(area) if area > 0 else 0.0
+            if fill_frac < theta_fill:
+                # Perpendicular to the longer axis:
+                if w >= h:
+                    best_c = -1
+                    min_mass = len(comp_idx) + 1
+                    best_dist = n
+                    for c_val in range(c0_t + 1, c1_t):
+                        mass = int(np.sum(cs == c_val))
+                        dist = abs(c_val - (c0_t + c1_t) / 2.0)
+                        if (mass < min_mass) or (mass == min_mass and dist < best_dist):
+                            min_mass = mass
+                            best_c = c_val
+                            best_dist = dist
+                    
+                    if best_c != -1 and min_mass == 0:
+                        sub1 = comp_idx[cs < best_c]
+                        sub2 = comp_idx[cs > best_c]
+                        if len(sub1) >= 4 and len(sub2) >= 4:
+                            final_blobs.append(sub1)
+                            final_blobs.append(sub2)
+                            did_split = True
+                else:
+                    best_r = -1
+                    min_mass = len(comp_idx) + 1
+                    best_dist = n
+                    for r_val in range(r0_t + 1, r1_t):
+                        mass = int(np.sum(rs == r_val))
+                        dist = abs(r_val - (r0_t + r1_t) / 2.0)
+                        if (mass < min_mass) or (mass == min_mass and dist < best_dist):
+                            min_mass = mass
+                            best_r = r_val
+                            best_dist = dist
+                            
+                    if best_r != -1 and min_mass == 0:
+                        sub1 = comp_idx[rs < best_r]
+                        sub2 = comp_idx[rs > best_r]
+                        if len(sub1) >= 4 and len(sub2) >= 4:
+                            final_blobs.append(sub1)
+                            final_blobs.append(sub2)
+                            did_split = True
+        if not did_split:
+            final_blobs.append(comp_idx)
 
-    if (x_max - x_min) < 2 or (y_max - y_min) < 2:
-        return None
+    # 3. Merging: compute padded bboxes and merge if IoU > 0.3
+    def calc_iou(b1, b2):
+        x1, y1, x2, y2 = b1
+        X1, Y1, X2, Y2 = b2
+        inter_w = max(0, min(x2, X2) - max(x1, X1))
+        inter_h = max(0, min(y2, Y2) - max(y1, Y1))
+        inter = inter_w * inter_h
+        area1 = (x2 - x1) * (y2 - y1)
+        area2 = (X2 - X1) * (Y2 - Y1)
+        union = area1 + area2 - inter
+        return inter / float(union) if union > 0 else 0.0
 
-    return (x_min, y_min, x_max, y_max)
+    while True:
+        bboxes = []
+        valid_indices = []
+        for i, comp_idx in enumerate(final_blobs):
+            rs = comp_idx // n
+            cs = comp_idx % n
+            r0_t, r1_t = int(rs.min()), int(rs.max())
+            c0_t, c1_t = int(cs.min()), int(cs.max())
+            bbox = get_padded_bbox(
+                r0_t, r1_t, c0_t, c1_t, n, H_px, W_px,
+                base_padding=base_padding, pad_frac=pad_frac,
+                min_crop_patches=min_crop_patches
+            )
+            if bbox is not None:
+                bboxes.append(bbox)
+                valid_indices.append(i)
+        
+        final_blobs = [final_blobs[i] for i in valid_indices]
+        
+        merged_any = False
+        num_blobs = len(final_blobs)
+        for i in range(num_blobs):
+            for j in range(i + 1, num_blobs):
+                if calc_iou(bboxes[i], bboxes[j]) > 0.3:
+                    merged_comp = np.union1d(final_blobs[i], final_blobs[j])
+                    final_blobs[i] = merged_comp
+                    final_blobs.pop(j)
+                    merged_any = True
+                    break
+            if merged_any:
+                break
+        
+        if not merged_any:
+            break
+
+    # 4. Fire condition
+    if len(final_blobs) < 2:
+        single_bbox = attention_zoom_bbox(
+            att_nn, H_px, W_px,
+            base_padding=base_padding, pad_frac=pad_frac,
+            min_crop_patches=min_crop_patches, thresh_mode=thresh_mode
+        )
+        return [single_bbox] if single_bbox is not None else []
+
+    # 5. Cap: keep top K=3 by hot-mass (attention sum)
+    def blob_mass(comp_idx):
+        return float(att_nn.ravel()[comp_idx].sum())
+
+    final_blobs = sorted(final_blobs, key=blob_mass, reverse=True)[:max_regions]
+
+    res_bboxes = []
+    for comp_idx in final_blobs:
+        rs = comp_idx // n
+        cs = comp_idx % n
+        r0_t, r1_t = int(rs.min()), int(rs.max())
+        c0_t, c1_t = int(cs.min()), int(cs.max())
+        bbox = get_padded_bbox(
+            r0_t, r1_t, c0_t, c1_t, n, H_px, W_px,
+            base_padding=base_padding, pad_frac=pad_frac,
+            min_crop_patches=min_crop_patches
+        )
+        if bbox is not None:
+            res_bboxes.append(bbox)
+            
+    return res_bboxes
 
 
 def patches_to_pixels(mask_nn: np.ndarray, H: int, W: int) -> np.ndarray:

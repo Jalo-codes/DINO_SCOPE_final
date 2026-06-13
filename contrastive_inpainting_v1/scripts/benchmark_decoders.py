@@ -22,6 +22,7 @@ from lab_utils.logging.text import install_log, log_line
 from lab_utils.data.dataset import LabDataset
 from lab_utils.data.loaders import LoaderConfig, build_eval_loader
 from lab_utils.train.checkpoint import load as ckpt_load
+from lab_utils.train.amp import resolve_amp
 from lab_utils.model.multi_head_detector import build_multi_head_detector
 from lab_utils.eval.partition import DecodeSpec, decode_deploy_mask, spherical_kmeans2, polarity_attn
 from lab_utils.eval.localization import (
@@ -78,6 +79,7 @@ def main():
     args = parser.parse_args()
 
     device = torch.device(args.device if (args.device != 'cuda' or torch.cuda.is_available()) else 'cpu')
+    use_amp, amp_dtype = resolve_amp(device, want_amp=True)
     cfg = Config()
     n = cfg.resolution.num_patches_per_side
     psz = cfg.resolution.patch_size
@@ -163,7 +165,7 @@ def main():
             if batch is None:
                 continue
             img = batch['img'].to(device, non_blocking=True)
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=(device.type == 'cuda')):
+            with torch.autocast(device_type='cuda', dtype=(amp_dtype or torch.float32), enabled=use_amp):
                 out = model(img)
             
             z_b = out.get('contrastive')
