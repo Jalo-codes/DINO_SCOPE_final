@@ -1,0 +1,90 @@
+{
+  "base_args": {
+    "imd2020_root": "/content/IMD2020",
+    "casia_root": "/content/casia",
+    "tgif_root": "/content/dataset_root/content/flux_originals",
+    "tgif_index": "/content/dataset_root/content/flux_originals/tgif2_index.json",
+    "coco_inpaint_root": "/content/inpaint_coco/",
+    "sagid_root": "/content/sagi_d_partial",
+    "casia_train": true,
+    "imd_val_only": true,
+    "train_samples": 4000,
+    "batch_size": 10,
+    "grad_accum": 1,
+    "num_workers": 4,
+    "lambda_image_bce": 1.0,
+    "lambda_contrastive": 2.0,
+    "pool_hidden": 256,
+    "contrastive_dim": 64,
+    "zoom_pass_prob": 0.0,
+    "aug_intensity": "heavy",
+    "bf16": true,
+    "val_zoom": true,
+    "viz_every": 1,
+    "no_grad_ckpt": true,
+    "num_epochs": 20,
+    "robust_every": 0
+  },
+  "runs": [
+    {
+      "name": "no_norm_tau15_60_with_all",
+      "module": "contrastive_inpainting_v1.scripts.train_multi_head",
+      "args": {
+        "tau_pos": 0.60,
+        "tau_neg": 0.15,
+        "anyedit_root": "/content/AnyEdit",
+        "bfree_root": "/content/B-Free-Subset-9k"
+      }
+    },
+    {
+      "name": "norm05_tau15_60_with_all",
+      "module": "contrastive_inpainting_v1.scripts.train_multi_head",
+      "args": {
+        "contrastive_norm_power": 0.5,
+        "tau_pos": 0.60,
+        "tau_neg": 0.15,
+        "anyedit_root": "/content/AnyEdit",
+        "bfree_root": "/content/B-Free-Subset-9k"
+      }
+    },
+    {
+      "name": "norm05_tau10_65_with_all",
+      "module": "contrastive_inpainting_v1.scripts.train_multi_head",
+      "args": {
+        "contrastive_norm_power": 0.5,
+        "tau_pos": 0.65,
+        "tau_neg": 0.10,
+        "anyedit_root": "/content/AnyEdit",
+        "bfree_root": "/content/B-Free-Subset-9k"
+      }
+    },
+    {
+      "name": "norm05_tau05_70_with_all",
+      "module": "contrastive_inpainting_v1.scripts.train_multi_head",
+      "args": {
+        "contrastive_norm_power": 0.5,
+        "tau_pos": 0.70,
+        "tau_neg": 0.05,
+        "anyedit_root": "/content/AnyEdit",
+        "bfree_root": "/content/B-Free-Subset-9k"
+      }
+    },
+    {
+      "name": "no_norm_tau15_60_no_bfree_anyedit",
+      "module": "contrastive_inpainting_v1.scripts.train_multi_head",
+      "args": {
+        "tau_pos": 0.60,
+        "tau_neg": 0.15
+      }
+    },
+    {
+      "name": "norm05_tau15_60_no_bfree_anyedit",
+      "module": "contrastive_inpainting_v1.scripts.train_multi_head",
+      "args": {
+        "contrastive_norm_power": 0.5,
+        "tau_pos": 0.60,
+        "tau_neg": 0.15
+      }
+    }
+  ]
+}
