@@ -858,10 +858,12 @@ def _build_parser() -> argparse.ArgumentParser:
     # labeled REAL per-patch: the hard negative teaching "VAE noise != forgery".
     # Default 0.15: a small sp-mimic slice keeps the paste-back framing covered
     # while the bulk trains on the harder full-VAE frames.
-    p.add_argument('--paste_frac', type=float, default=0.15,
+    p.add_argument('--paste_frac', type=float, default=0.5,
                    help='Fraction of inpaint items pasted onto pristine bg '
-                        '(1.0 = all regional splices; default 0.15 keeps most '
-                        'as full-AE positives). TRAIN only; eval always pastes.')
+                        '(1.0 = all regional splices with real backgrounds; '
+                        '0.5 = even split pasted vs full-AE positive). Higher '
+                        'matches the real-background OOD (tgif) distribution. '
+                        'TRAIN only; eval always pastes.')
     # Train-time gaussian-noise override (laundering robustness). None = leave
     # the aug_intensity preset untouched. Forces the semantic pathway to carry
     # the load instead of leaning on the high-frequency VAE fingerprint.
@@ -1440,14 +1442,19 @@ def main():
                 splice_sources.add(str(item.get('source', 'unknown')))
         
         if 'casia' in splice_sources and len(splice_sources) > 1:
-            source_fracs = {'casia': 0.3}
-            other_share = 0.7 / (len(splice_sources) - 1)
+            # CASIA is the scarce genuine-splice (real-background) signal we most
+            # want the localizer to learn, so it carries HALF the splice budget;
+            # the remaining half is split evenly across the other splice sources
+            # (auto-adapts when sources like anyedit are dropped).
+            casia_frac = 0.5
+            source_fracs = {'casia': casia_frac}
+            other_share = (1.0 - casia_frac) / (len(splice_sources) - 1)
             for src in splice_sources:
                 if src != 'casia':
                     source_fracs[src] = other_share
             weights, mix_stats = source_splice_balance_weights(
                 train_items, source_fracs, target_splice_frac=0.5)
-            log_line(f'[cfg] splice_mix (automatic 30% Casia drop): {source_fracs}')
+            log_line(f'[cfg] splice_mix (CASIA weighted to {casia_frac:.0%}): {source_fracs}')
             log_line(f'[cfg] splice_mix realized: {mix_stats}')
         else:
             weights = _splice_balance_weights(train_items)

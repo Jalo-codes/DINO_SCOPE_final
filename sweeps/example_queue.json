@@ -3,7 +3,6 @@
   "base_args": {
     "imd2020_root": "/content/IMD2020",
     "casia_root": "/content/casia",
-    "anyedit_root": "/content/AnyEdit",
     "casia_train": true,
     "imd_val_only": true,
     "eval_decode": "graph",

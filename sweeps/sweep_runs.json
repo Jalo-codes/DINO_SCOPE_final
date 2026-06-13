@@ -33,7 +33,6 @@
       "args": {
         "tau_pos": 0.60,
         "tau_neg": 0.15,
-        "anyedit_root": "/content/AnyEdit",
         "bfree_root": "/content/B-Free-Subset-9k"
       }
     },
@@ -44,7 +43,6 @@
         "contrastive_norm_power": 0.5,
         "tau_pos": 0.60,
         "tau_neg": 0.15,
-        "anyedit_root": "/content/AnyEdit",
         "bfree_root": "/content/B-Free-Subset-9k"
       }
     },
@@ -55,7 +53,6 @@
         "contrastive_norm_power": 0.5,
         "tau_pos": 0.65,
         "tau_neg": 0.10,
-        "anyedit_root": "/content/AnyEdit",
         "bfree_root": "/content/B-Free-Subset-9k"
       }
     },
@@ -66,7 +63,6 @@
         "contrastive_norm_power": 0.5,
         "tau_pos": 0.70,
         "tau_neg": 0.05,
-        "anyedit_root": "/content/AnyEdit",
         "bfree_root": "/content/B-Free-Subset-9k"
       }
     },
