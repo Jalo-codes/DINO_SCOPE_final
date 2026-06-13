@@ -83,6 +83,69 @@ def build_heavy_aug_kwargs(cfg) -> Dict:
     )
 
 
+def build_noise_moderate_aug_kwargs(cfg) -> Dict:
+    """Noise-shortcut-killing regime (moderate).
+
+    Unlike light/medium/heavy — which deliberately cap Gaussian σ ≤ 0.075 to
+    *preserve* the splice's noise-fingerprint signal — these presets exist to
+    DESTROY that fingerprint. The goal of this detector is SEMANTIC
+    displacement, not noise displacement: we want perturbations that wash out
+    per-pixel noise statistics (Gaussian + Poisson shot noise) while leaving
+    the scene semantics intact, so the model cannot lean on the cheap noise
+    shortcut and is forced onto semantic cues.
+
+    Moderate = ~1.5× the heavy Gaussian ceiling plus a minority Poisson roll.
+    Most samples get at least one noise family; combinations are common.
+    """
+    return dict(
+        jpeg_prob=0.50,
+        jpeg_q_min=45,
+        jpeg_q_max=95,
+        noise_prob=0.60,
+        noise_std_min=0.010,
+        noise_std_max=0.110,
+        poisson_prob=0.40,
+        poisson_peak_min=24.0,
+        poisson_peak_max=80.0,
+        resize_prob=0.30,
+        resize_scale_min=0.55,
+        resize_scale_max=0.95,
+        flip_prob=cfg.LIGHT_FLIP_PROB,
+        blur_prob=0.20,
+        blur_sigma_min=0.2,
+        blur_sigma_max=1.5,
+    )
+
+
+def build_noise_aggressive_aug_kwargs(cfg) -> Dict:
+    """Noise-shortcut-killing regime (aggressive).
+
+    Same intent as `build_noise_moderate_aug_kwargs` but turned up: ~2× the
+    heavy Gaussian ceiling, heavier Poisson (lower peak floor), and high
+    per-family probabilities so the noise fingerprint is gone on the large
+    majority of training samples. Use this when the model is still acing
+    AI-gen / in-domain via the noise shortcut but failing OOD.
+    """
+    return dict(
+        jpeg_prob=0.55,
+        jpeg_q_min=40,
+        jpeg_q_max=95,
+        noise_prob=0.80,
+        noise_std_min=0.020,
+        noise_std_max=0.160,
+        poisson_prob=0.60,
+        poisson_peak_min=8.0,
+        poisson_peak_max=48.0,
+        resize_prob=0.35,
+        resize_scale_min=0.45,
+        resize_scale_max=0.95,
+        flip_prob=cfg.LIGHT_FLIP_PROB,
+        blur_prob=0.25,
+        blur_sigma_min=0.2,
+        blur_sigma_max=2.0,
+    )
+
+
 def build_aug_kwargs(cfg, intensity: str) -> Dict:
     """Dispatch on a string intensity name. 'none' returns no-op kwargs."""
     intensity = (intensity or 'light').lower()
@@ -100,8 +163,13 @@ def build_aug_kwargs(cfg, intensity: str) -> Dict:
         return build_medium_aug_kwargs(cfg)
     if intensity == 'heavy':
         return build_heavy_aug_kwargs(cfg)
-    raise ValueError(f"unknown aug intensity {intensity!r}; "
-                     f"expected 'none' | 'light' | 'medium' | 'heavy'")
+    if intensity == 'noise_moderate':
+        return build_noise_moderate_aug_kwargs(cfg)
+    if intensity == 'noise_aggressive':
+        return build_noise_aggressive_aug_kwargs(cfg)
+    raise ValueError(
+        f"unknown aug intensity {intensity!r}; expected 'none' | 'light' | "
+        f"'medium' | 'heavy' | 'noise_moderate' | 'noise_aggressive'")
 
 
 def build_degradation_kwargs(cfg) -> Dict:
@@ -207,6 +275,8 @@ __all__ = [
     'build_light_aug_kwargs',
     'build_medium_aug_kwargs',
     'build_heavy_aug_kwargs',
+    'build_noise_moderate_aug_kwargs',
+    'build_noise_aggressive_aug_kwargs',
     'dataset_noise_kwargs',
     'eval_aug_settings',
 ]

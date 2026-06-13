@@ -45,6 +45,7 @@ from lab_utils.train.amp import resolve_amp
 from lab_utils.train.distributed import (
     DistributedContext,
     barrier,
+    broadcast_scalar,
     cleanup as ddp_cleanup,
     setup as ddp_setup,
     unwrap_model,
@@ -731,6 +732,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('--checkpoint_root', '--run_root', dest='checkpoint_root', type=str, default=None)
     p.add_argument('--resume',           type=str, default=None)
     p.add_argument('--num_epochs',       type=int, default=10)
+    p.add_argument('--warmup_epochs',    type=float, default=1.0,
+                   help='Linear LR warmup length (in epochs) before cosine decay. '
+                        'Delays the high-LR phase so the generalization peak lands '
+                        'later (~epoch 4-5) instead of overfitting at epoch 2-3. '
+                        '0 disables warmup (pure cosine, legacy behavior).')
+    p.add_argument('--early_stop_patience', type=int, default=3,
+                   help='Stop if the tgif zoom-IoU metric has not improved for this '
+                        'many consecutive eval epochs. <=0 disables early stopping.')
+    p.add_argument('--early_stop_min_delta', type=float, default=0.002,
+                   help='Minimum tgif zoom-IoU improvement to count as progress.')
     p.add_argument('--batch_size',       type=int, default=8)
     p.add_argument('--grad_accum',       type=int, default=4)
     p.add_argument('--lr',               type=float, default=2e-4)
@@ -957,12 +968,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument('--aug_curriculum_max', type=float, default=0.75,
                    help='Final curriculum strength (1.0 = the full heavy preset).')
     p.add_argument('--aug_intensity',    type=str, default='medium',
-                   choices=('none', 'light', 'medium', 'heavy'))
+                   choices=('none', 'light', 'medium', 'heavy',
+                            'noise_moderate', 'noise_aggressive'),
+                   help="'noise_moderate'/'noise_aggressive' push Gaussian+Poisson "
+                        "noise past the splice-preserving floor to kill the noise "
+                        "shortcut and force semantic cues.")
     # Robustness sweep
     p.add_argument('--robust_every',     type=int, default=3)
     p.add_argument('--robust_conditions', type=str, nargs='+',
                    default=list(DEFAULT_EVAL_AUG_CONDITIONS))
     p.add_argument('--eval_max_items',   type=int, default=200)
+    p.add_argument('--no_tqdm',           action='store_true', default=False,
+                   help='Disable tqdm progress bars entirely.')
     # Contrastive loss (symmetric is the v2 default; legacy kept for parity).
     # None ⇒ keep the cfg default.
     p.add_argument('--contrastive_loss_mode', type=str, default=None,
@@ -1579,9 +1596,25 @@ def main():
     )
     steps_per_epoch = max(1, math.ceil(per_rank_samples / args.batch_size / args.grad_accum))
     total_steps = args.num_epochs * steps_per_epoch
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=total_steps, eta_min=args.lr * 0.05,
-    )
+    warmup_steps = int(round(max(0.0, args.warmup_epochs) * steps_per_epoch))
+    warmup_steps = min(warmup_steps, max(0, total_steps - 1))
+    eta_min = args.lr * 0.05
+    if warmup_steps > 0:
+        # Linear warmup → cosine decay. Warmup keeps the early-epoch effective
+        # LR low so the model doesn't race to memorize the easy noise shortcut
+        # in epochs 1-2; the productive (peak-LR) window then lands later and
+        # the held-out peak shifts toward epoch 4-5 instead of 2-3.
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=eta_min)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
+        log_line(f'[cfg] LR warmup {warmup_steps} steps (~{args.warmup_epochs:.2f} ep) '
+                 f'→ cosine over {total_steps - warmup_steps} steps, eta_min={eta_min:.2e}')
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_steps, eta_min=eta_min)
 
     pos_weight = torch.ones(1, dtype=torch.float32, device=device)
     log_line('[cfg] pos_weight=1.0 (sampler-balanced, no class reweight)')
@@ -1594,6 +1627,12 @@ def main():
 
     # ── training loop ────────────────────────────────────────────────────────
     global_step = 0
+    # Early stopping on the OOD tgif zoom-IoU metric (the held-out signal we
+    # actually care about). Rank 0 computes it; the stop decision is broadcast
+    # so all ranks break in lockstep and don't deadlock at the barrier.
+    best_zoom_metric  = float('-inf')
+    best_zoom_epoch   = -1
+    epochs_no_improve = 0
     for epoch in range(start_epoch, args.num_epochs):
         # ── aug curriculum: set this epoch's TRAIN aug before the loader
         # iterator is created (workers fork per epoch and inherit the change;
@@ -1651,7 +1690,8 @@ def main():
         _pbar = tqdm(enumerate(train_loader), total=_n_batches,
                      desc=f'Epoch {epoch}/{args.num_epochs-1}',
                      dynamic_ncols=True, leave=True,
-                     miniters=max(1, _n_batches // 20))
+                     miniters=max(1, _n_batches // 20),
+                     disable=args.no_tqdm or not sys.stdout.isatty())
 
         for step, batch in _pbar:
             if batch is None:
@@ -1996,6 +2036,7 @@ def main():
         )
 
         # ── eval + checkpoint: rank 0 only (other ranks wait at the barrier) ──
+        stop_local = 0.0   # rank-0 sets this; broadcast to all ranks after barrier
         if ctx.is_main:
             eval_model = unwrap_model(model)   # bare module for inference
             bce_adapter = _BCEHeadAdapter(eval_model) if has_bce_head else None
@@ -2076,6 +2117,10 @@ def main():
                 log_line(f'[eval] patch BCE step elapsed={time.time() - t0:.2f}s')
 
             # 4. Zoom Eval (Contrastive head) - Condensed report, skip oracle, skip confidence gating
+            # tgif cells (tag 'tgif_val/...') feed the early-stop metric: the
+            # n-weighted mean of per-cell aggregate ZOOM-IoU medians.
+            zoom_tgif_num = 0.0   # Σ (median * n) over tgif cells
+            zoom_tgif_den = 0     # Σ n over tgif cells
             if args.val_zoom and args.contrastive_dim > 0:
                 t0 = time.time()
                 for _, zoom_items, tag in eval_sources:
@@ -2087,9 +2132,16 @@ def main():
                         skip_oracle=True, decode_spec=_eval_decode_spec(args, cfg),
                         log_tag='[eval]', tag=tag,
                     )
-                    report_zoom_eval(
+                    zreport = report_zoom_eval(
                         zsamples, condensed=True, log_tag='[eval]', tag=tag,
                     )
+                    if str(tag).startswith('tgif'):
+                        agg = (zreport or {}).get('aggregate', {}).get('zoom', {})
+                        n_c = int(agg.get('n', 0) or 0)
+                        med = agg.get('median', float('nan'))
+                        if n_c > 0 and med == med:  # finite
+                            zoom_tgif_num += float(med) * n_c
+                            zoom_tgif_den += n_c
                 log_line(f'[eval] zoom step elapsed={time.time() - t0:.2f}s')
 
             # ── robustness sweep (BCE head) ──────────────────────────────────
@@ -2160,8 +2212,41 @@ def main():
             ckpt_save({'model': unwrap_model(model).state_dict(), 'epoch': epoch + 1,
                        'optimizer': optimizer.state_dict()}, ckpt_path)
 
+            # ── best-checkpoint + early stop (tgif zoom-IoU) ───────────────────
+            zoom_metric = (zoom_tgif_num / zoom_tgif_den) if zoom_tgif_den > 0 else float('nan')
+            if zoom_metric == zoom_metric:  # finite → tgif zoom eval ran
+                if zoom_metric > best_zoom_metric + args.early_stop_min_delta:
+                    best_zoom_metric = zoom_metric
+                    best_zoom_epoch  = epoch
+                    epochs_no_improve = 0
+                    best_path = os.path.join(args.checkpoint_root, 'best.pt')
+                    ckpt_save({'model': unwrap_model(model).state_dict(),
+                               'epoch': epoch + 1, 'optimizer': optimizer.state_dict(),
+                               'tgif_zoom_iou': best_zoom_metric}, best_path)
+                    log_line(f'[earlystop] epoch={epoch} tgif_zoom_iou={zoom_metric:.4f} '
+                             f'→ NEW BEST, saved best.pt')
+                else:
+                    epochs_no_improve += 1
+                    log_line(f'[earlystop] epoch={epoch} tgif_zoom_iou={zoom_metric:.4f} '
+                             f'(best={best_zoom_metric:.4f} @ep{best_zoom_epoch}; '
+                             f'no improve {epochs_no_improve}/{args.early_stop_patience})')
+                if args.early_stop_patience > 0 and epochs_no_improve >= args.early_stop_patience:
+                    stop_local = 1.0
+                    log_line(f'[earlystop] patience exhausted → stopping after epoch={epoch}')
+            elif args.early_stop_patience > 0:
+                log_line('[earlystop] no tgif zoom metric this epoch '
+                         '(need --val_zoom + --tgif_root); not counting toward patience')
+
         # Keep ranks in lockstep: workers wait here while rank 0 evals + saves.
         barrier(ctx)
+
+        # Broadcast rank-0's stop decision so every rank breaks together and
+        # no rank is left blocking at the next epoch's barrier.
+        if args.early_stop_patience > 0:
+            if broadcast_scalar(stop_local, device, src=0) >= 0.5:
+                log_line(f'[earlystop] training stopped early; best tgif_zoom_iou='
+                         f'{best_zoom_metric:.4f} @ epoch {best_zoom_epoch} (best.pt)')
+                break
 
     log_line('[train] training complete')
     ddp_cleanup()   # explicit, deterministic teardown (atexit is the crash net)

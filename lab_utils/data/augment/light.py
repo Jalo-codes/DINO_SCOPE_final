@@ -38,6 +38,20 @@ def _add_gaussian(img: Image.Image, std: float) -> Image.Image:
     return Image.fromarray((arr * 255).astype(np.uint8))
 
 
+def _add_poisson(img: Image.Image, peak: float) -> Image.Image:
+    """Signal-dependent Poisson (shot) noise. Lower `peak` → heavier noise.
+
+    Photon shot noise scales with intensity, so it destroys the camera's
+    fixed-pattern / PRNU noise fingerprint (the cheap shortcut) without
+    moving the underlying semantics — exactly the perturbation we want when
+    training a *semantic*-displacement detector rather than a noise one.
+    """
+    arr  = np.array(img).astype(np.float32) / 255.0
+    peak = max(1.0, float(peak))
+    out  = np.clip(np.random.poisson(arr * peak) / peak, 0, 1)
+    return Image.fromarray((out * 255).astype(np.uint8))
+
+
 def _resize_jitter(img: Image.Image, scale: float) -> Image.Image:
     w, h = img.size
     sw = max(8, int(round(w * float(scale))))
@@ -96,6 +110,32 @@ def apply_gaussian_noise(
     severity = float(np.clip((std - std_min) / max(1e-8, std_max - std_min), 0.0, 1.0))
     out = _add_gaussian(img, std)
     op  = AppliedOp(name='gaussian_noise', params={'std': float(std)}, severity=severity)
+    return AugmentResult(image=out, mask=mask, applied=(op,))
+
+
+def apply_poisson_noise(
+    img: Image.Image,
+    mask: Optional[Image.Image] = None,
+    *,
+    peak: float,
+    peak_range: tuple = (8.0, 128.0),
+) -> AugmentResult:
+    """Add signal-dependent Poisson (shot) noise.
+
+    Args:
+        img:        Input PIL RGB image.
+        mask:       Optional mask (passed through unchanged; label-preserving).
+        peak:       Photon-count peak. LOWER → heavier noise.
+        peak_range: (min, max) used to normalize severity; severity rises as
+                    peak falls toward the min.
+
+    Returns:
+        AugmentResult with name='poisson_noise', params={'peak': peak}.
+    """
+    p_min, p_max = peak_range
+    severity = float(np.clip((p_max - peak) / max(1e-8, p_max - p_min), 0.0, 1.0))
+    out = _add_poisson(img, peak)
+    op  = AppliedOp(name='poisson_noise', params={'peak': float(peak)}, severity=severity)
     return AugmentResult(image=out, mask=mask, applied=(op,))
 
 
@@ -167,6 +207,9 @@ def apply_light_augmentations(
     noise_prob: float = 0.15,
     noise_std_min: float = 0.002,
     noise_std_max: float = 0.015,
+    poisson_prob: float = 0.0,
+    poisson_peak_min: float = 16.0,
+    poisson_peak_max: float = 64.0,
     resize_prob: float = 0.20,
     resize_scale_min: float = 0.80,
     resize_scale_max: float = 0.98,
@@ -198,6 +241,14 @@ def apply_light_augmentations(
         std = random.uniform(noise_std_min, noise_std_max)
         res = apply_gaussian_noise(out, out_mask, std=std,
                                    std_range=(noise_std_min, noise_std_max))
+        out = res.image
+        applied.extend(res.applied)
+
+    if random.random() < poisson_prob:
+        # peak sampled in [min, max]; lower peak = heavier shot noise
+        peak = random.uniform(poisson_peak_min, poisson_peak_max)
+        res  = apply_poisson_noise(out, out_mask, peak=peak,
+                                   peak_range=(poisson_peak_min, poisson_peak_max))
         out = res.image
         applied.extend(res.applied)
 

@@ -23,7 +23,8 @@
     "viz_every": 1,
     "no_grad_ckpt": true,
     "num_epochs": 10,
-    "robust_every": 0
+    "robust_every": 0,
+    "no_tqdm": true
   },
   "runs": [
     {
