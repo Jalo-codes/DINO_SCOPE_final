@@ -2223,18 +2223,18 @@ def main():
                     ckpt_save({'model': unwrap_model(model).state_dict(),
                                'epoch': epoch + 1, 'optimizer': optimizer.state_dict(),
                                'tgif_zoom_iou': best_zoom_metric}, best_path)
-                    log_line(f'[earlystop] epoch={epoch} tgif_zoom_iou={zoom_metric:.4f} '
+                    log_line(f'[train] earlystop: epoch={epoch} tgif_zoom_iou={zoom_metric:.4f} '
                              f'→ NEW BEST, saved best.pt')
                 else:
                     epochs_no_improve += 1
-                    log_line(f'[earlystop] epoch={epoch} tgif_zoom_iou={zoom_metric:.4f} '
+                    log_line(f'[train] earlystop: epoch={epoch} tgif_zoom_iou={zoom_metric:.4f} '
                              f'(best={best_zoom_metric:.4f} @ep{best_zoom_epoch}; '
                              f'no improve {epochs_no_improve}/{args.early_stop_patience})')
                 if args.early_stop_patience > 0 and epochs_no_improve >= args.early_stop_patience:
                     stop_local = 1.0
-                    log_line(f'[earlystop] patience exhausted → stopping after epoch={epoch}')
+                    log_line(f'[train] earlystop: patience exhausted → stopping after epoch={epoch}')
             elif args.early_stop_patience > 0:
-                log_line('[earlystop] no tgif zoom metric this epoch '
+                log_line('[train] earlystop: no tgif zoom metric this epoch '
                          '(need --val_zoom + --tgif_root); not counting toward patience')
 
         # Keep ranks in lockstep: workers wait here while rank 0 evals + saves.
@@ -2244,7 +2244,7 @@ def main():
         # no rank is left blocking at the next epoch's barrier.
         if args.early_stop_patience > 0:
             if broadcast_scalar(stop_local, device, src=0) >= 0.5:
-                log_line(f'[earlystop] training stopped early; best tgif_zoom_iou='
+                log_line(f'[train] earlystop: training stopped early; best tgif_zoom_iou='
                          f'{best_zoom_metric:.4f} @ epoch {best_zoom_epoch} (best.pt)')
                 break
 
