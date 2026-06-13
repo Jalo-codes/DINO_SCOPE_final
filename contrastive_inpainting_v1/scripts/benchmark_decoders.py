@@ -70,6 +70,8 @@ def main():
     parser.add_argument('--graph_s_edge', type=float, default=0.30)
     parser.add_argument('--graph_knn', type=int, default=10)
     parser.add_argument('--graph_m_min', type=int, default=4)
+    parser.add_argument('--graph_theta_w', type=float, default=None)
+    parser.add_argument('--graph_theta_x', type=float, default=None)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='cuda')
@@ -134,6 +136,8 @@ def main():
         s_edge=args.graph_s_edge,
         mutual_knn_k=args.graph_knn,
         m_min=args.graph_m_min,
+        theta_w=args.graph_theta_w,
+        theta_x=args.graph_theta_x,
     )
     graph_sp_spec = DecodeSpec(
         method='graph',
@@ -143,6 +147,8 @@ def main():
         mutual_knn_k=args.graph_knn,
         r_spatial=2,
         m_min=args.graph_m_min,
+        theta_w=args.graph_theta_w,
+        theta_x=args.graph_theta_x,
     )
 
     results = {
